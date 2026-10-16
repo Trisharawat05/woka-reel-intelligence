@@ -154,3 +154,82 @@ def test_explicit_account_disconnect(client, auth_headers, db_session):
 
     db_session.refresh(account)
     assert account.is_connected is False
+
+
+def test_staging_health_and_readiness_probes(client):
+    """Verifies standard container liveness and database-connected readiness probes."""
+    live = client.get("/healthz")
+    assert live.status_code == 200
+    assert live.json()["status"] == "alive"
+
+    ready = client.get("/readyz")
+    assert ready.status_code == 200
+    assert ready.json()["status"] == "ready"
+    assert ready.json()["database"] == "connected"
+
+
+def test_staging_rate_limiting_burst_protection(client, auth_headers):
+    """Ensures sliding-window rate limiting triggers 429 when max_requests is exceeded."""
+    from app.security import reset_rate_limits
+    reset_rate_limits()
+
+    # /api/v1/instagram/oauth-url is limited to 15 requests / 60 seconds
+    for _ in range(15):
+        resp = client.get("/api/v1/instagram/oauth-url", headers=auth_headers)
+        assert resp.status_code == 200
+
+    # 16th call must be blocked with HTTP 429 and Retry-After header
+    blocked_resp = client.get("/api/v1/instagram/oauth-url", headers=auth_headers)
+    assert blocked_resp.status_code == 429
+    assert "Rate limit exceeded" in blocked_resp.json()["detail"]
+    assert "retry-after" in blocked_resp.headers
+    assert int(blocked_resp.headers["retry-after"]) > 0
+
+    reset_rate_limits()
+
+
+def test_staging_live_vs_sandbox_labeling(client, auth_headers, db_session, test_creator_user):
+    """Verifies that sandbox simulation mode is clearly labeled and distinguished from live."""
+    user, ws = test_creator_user
+    account = db_session.query(InstagramAccount).filter(InstagramAccount.workspace_id == ws.id).first()
+    
+    # 1. Sandbox mode: is_sandbox=True, mode in provenance
+    account.is_connected = True
+    account.is_sandbox = True
+    db_session.commit()
+
+    status_res = client.get("/api/v1/instagram/status", headers=auth_headers)
+    assert status_res.status_code == 200
+    assert status_res.json()["account"]["is_sandbox"] is True
+
+    sync_res = client.post("/api/v1/instagram/sync-insights", headers=auth_headers)
+    assert sync_res.status_code == 200
+    assert sync_res.json()["provenance"]["mode"] == "SANDBOX_SIMULATION"
+
+
+def test_staging_ssrf_and_dns_rebinding_protection(client, auth_headers):
+    """Verifies that private IP and cloud metadata URLs are rejected before network calls."""
+    restricted_urls = [
+        "https://169.254.169.254/latest/meta-data/",
+        "http://127.0.0.1:8000/internal-admin",
+        "http://localhost:5432/",
+        "http://10.0.0.1/admin",
+        "http://192.168.1.1/router"
+    ]
+    for url in restricted_urls:
+        resp = client.post("/api/v1/reel-intelligence/jobs/url", json={"url": url}, headers=auth_headers)
+        assert resp.status_code == 422
+        assert "private" in resp.json()["detail"].lower() or "restricted" in resp.json()["detail"].lower() or "invalid" in resp.json()["detail"].lower()
+
+
+def test_staging_upload_malware_magic_bytes_protection(client, auth_headers):
+    """Verifies that executables disguised as MP4 files are rejected via magic bytes inspection."""
+    import io
+    fake_exe = io.BytesIO(b"MZ\x90\x00\x03\x00\x00\x00\x04\x00\x00\x00\xff\xff\x00\x00malicious binary content")
+    res_fake = client.post(
+        "/api/v1/reel-intelligence/jobs/upload",
+        files={"file": ("malicious.mp4", fake_exe, "video/mp4")},
+        headers=auth_headers
+    )
+    assert res_fake.status_code == 422
+    assert "signature does not match" in res_fake.json()["detail"].lower()

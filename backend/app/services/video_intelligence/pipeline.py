@@ -116,6 +116,7 @@ def run_video_intelligence_pipeline(
         "safe_zones": {
             "status": safe_zone_status,
             "hazard_ratio": safe_zone_hazard,
+            "subtitle_readability_score": video_metrics.get("subtitle_readability_score", 88.0),
             "guidelines": safe_zone_notes
         },
         "cta_assessment": {

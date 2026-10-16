@@ -49,10 +49,7 @@ backend/woka.db
 staging/ssl/*.pem
 staging/ssl/*.key
 
-# OS & Editor Artifacts
-.DS_Store
-Thumbs.db
-.vscode/
-.idea/
-*.swp
-*.swo
+# Media Storage
+media_storage/
+backend/media_storage/
+

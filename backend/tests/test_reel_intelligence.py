@@ -250,3 +250,131 @@ def test_invalid_url_validation_rejection(client, auth_headers):
         headers=auth_headers
     )
     assert res.status_code == 422
+
+
+def test_ssrf_and_private_network_rejection(client, auth_headers):
+    """Ensures SSRF attacks targeting localhost, loopback, or private networks are blocked."""
+    private_targets = [
+        "http://127.0.0.1/video.mp4",
+        "http://127.0.0.1:8000/api/v1/users",
+        "http://169.254.169.254/latest/meta-data",
+        "http://localhost/exploit.mp4",
+        "http://0.0.0.0/test.mp4",
+        "ftp://instagram.com/reel/C123/"
+    ]
+    for target in private_targets:
+        res = client.post(
+            "/api/v1/reel-intelligence/jobs/url",
+            json={"url": target},
+            headers=auth_headers
+        )
+        assert res.status_code == 422, f"Target {target} should have been rejected with 422"
+
+
+def test_upload_magic_bytes_inspection(client, auth_headers):
+    """Ensures disguised executable payloads are rejected and valid video streams are accepted."""
+    import io
+
+    # 1. Reject executable disguised as MP4
+    fake_exe = io.BytesIO(b"MZ\x90\x00\x03\x00\x00\x00\x04\x00\x00\x00\xff\xff\x00\x00malicious binary content")
+    res_fake = client.post(
+        "/api/v1/reel-intelligence/jobs/upload",
+        files={"file": ("malicious.mp4", fake_exe, "video/mp4")},
+        headers=auth_headers
+    )
+    assert res_fake.status_code == 422
+    assert "signature does not match" in res_fake.json()["detail"]
+
+    # 2. Reject unsupported MIME type
+    text_file = io.BytesIO(b"simple text content")
+    res_mime = client.post(
+        "/api/v1/reel-intelligence/jobs/upload",
+        files={"file": ("text.txt", text_file, "text/plain")},
+        headers=auth_headers
+    )
+    assert res_mime.status_code == 400
+
+    # 3. Accept valid MP4 container
+    valid_mp4_header = b"\x00\x00\x00\x1cftypisom\x00\x00\x02\x00isomiso2mp41\x00\x00\x00\x08free\x00\x00\x00\x08mdat"
+    valid_video = io.BytesIO(valid_mp4_header + b"\x00" * 1024)
+    res_valid = client.post(
+        "/api/v1/reel-intelligence/jobs/upload",
+        files={"file": ("good_reel.mp4", valid_video, "video/mp4")},
+        headers=auth_headers
+    )
+    assert res_valid.status_code == 202
+    assert res_valid.json()["analysis_mode"] == "VIDEO_UPLOAD"
+
+
+def test_idempotent_job_submission(client, auth_headers):
+    """Submitting the exact same URL while a job is active returns the existing job."""
+    test_url = "https://www.instagram.com/reel/CIdempotent123/"
+    
+    res1 = client.post("/api/v1/reel-intelligence/jobs/url", json={"url": test_url}, headers=auth_headers)
+    assert res1.status_code == 202
+    job1_id = res1.json()["id"]
+
+    res2 = client.post("/api/v1/reel-intelligence/jobs/url", json={"url": test_url}, headers=auth_headers)
+    assert res2.status_code == 202
+    job2_id = res2.json()["id"]
+
+    # Returns the same job ID
+    assert job1_id == job2_id
+
+
+def test_quota_exhaustion_enforcement(client, auth_headers, db_session, test_creator_user):
+    """Verifies that exceeding monthly AI quota blocks new analysis submissions with 429."""
+    from app.services.subscription_service import get_workspace_subscription
+
+    _, workspace = test_creator_user
+    sub = get_workspace_subscription(db_session, workspace.id)
+    # Simulate full consumption of monthly quota
+    sub.ai_used_monthly = sub.ai_limit_monthly
+    db_session.commit()
+
+    res = client.post(
+        "/api/v1/reel-intelligence/jobs/url",
+        json={"url": "https://www.instagram.com/reel/CQuotaExceeded/"},
+        headers=auth_headers
+    )
+    assert res.status_code == 429
+    assert "quota exceeded" in res.json()["detail"].lower()
+
+    # Reset quota so subsequent tests pass cleanly
+    sub.ai_used_monthly = 0
+    db_session.commit()
+
+
+def test_job_retry_rules(client, auth_headers):
+    """Verifies that completed jobs cannot be retried, but failed jobs can."""
+    # Create and run a connected reel job to completion
+    res = client.post(
+        "/api/v1/reel-intelligence/jobs/connected",
+        json={"media_id": "reel_retry_test"},
+        headers=auth_headers
+    )
+    job_id = res.json()["id"]
+
+    # Poll status (TestClient completes background tasks synchronously)
+    poll = client.get(f"/api/v1/reel-intelligence/jobs/{job_id}", headers=auth_headers)
+    assert poll.json()["status"] == "COMPLETED"
+
+    # Attempting to retry completed job returns 400
+    retry_res = client.post(f"/api/v1/reel-intelligence/jobs/{job_id}/retry", headers=auth_headers)
+    assert retry_res.status_code == 400
+    assert "Cannot retry" in retry_res.json()["detail"]
+
+
+def test_report_history_listing_and_filtering(client, auth_headers):
+    """Verifies searching and filtering analysis history."""
+    res = client.get("/api/v1/reel-intelligence/reports?limit=10", headers=auth_headers)
+    assert res.status_code == 200
+    reports = res.json()
+    assert isinstance(reports, list)
+    if len(reports) > 0:
+        first_title = reports[0]["title"]
+        # Search filter
+        search_res = client.get(f"/api/v1/reel-intelligence/reports?search={first_title[:4]}", headers=auth_headers)
+        assert search_res.status_code == 200
+        assert len(search_res.json()) >= 1
+

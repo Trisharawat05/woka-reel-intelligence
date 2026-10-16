@@ -8,6 +8,10 @@ from typing import Dict, Any, List, Optional
 from sqlalchemy.orm import Session
 from fastapi import HTTPException, status, UploadFile
 
+import socket
+import ipaddress
+from urllib.parse import urlparse
+
 from app.models.reel_intelligence import (
     ReelAnalysisJob,
     ReelMediaAsset,
@@ -20,14 +24,56 @@ from app.models.analytics import CreatorAnalytics
 from app.services.video_intelligence.pipeline import run_video_intelligence_pipeline
 from app.services.reel_analytics_service import calculate_reel_performance_metrics
 from app.services.reel_ai_diagnosis_service import generate_ai_diagnosis_report
+from app.services.subscription_service import check_and_increment_ai_quota
 
 STORAGE_BASE_DIR = "media_storage"
 ALLOWED_VIDEO_MIMES = ["video/mp4", "video/quicktime", "video/webm", "video/x-m4v"]
 MAX_VIDEO_SIZE_BYTES = 100 * 1024 * 1024  # 100 MB
 
 
+def is_ip_private_or_restricted(ip_str: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(ip_str)
+        return (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        )
+    except ValueError:
+        return False
+
+
+def validate_video_file_magic_bytes(header_bytes: bytes) -> bool:
+    """Inspects binary file signature to verify video container and reject executables."""
+    if not header_bytes or len(header_bytes) < 4:
+        return False
+    
+    # Reject dangerous executable formats immediately
+    if header_bytes.startswith(b"MZ"):  # Windows PE executable
+        return False
+    if header_bytes.startswith(b"\x7fELF"):  # Linux ELF executable
+        return False
+    if header_bytes.startswith(b"#!/") or header_bytes.startswith(b"<?php"):
+        return False
+    if b"<html" in header_bytes.lower() or b"<!doctype" in header_bytes.lower():
+        return False
+
+    # MP4 / M4V / MOV signature: typically contains 'ftyp' in first 32 bytes or 'moov' / 'mdat' / 'wide'
+    if b"ftyp" in header_bytes[:32] or b"moov" in header_bytes[:32] or b"mdat" in header_bytes[:32] or b"wide" in header_bytes[:32]:
+        return True
+
+    # WebM / MKV starts with \x1a\x45\xdf\xa3
+    if header_bytes.startswith(b"\x1a\x45\xdf\xa3"):
+        return True
+
+    return True  # Fallback for other valid raw video formats
+
+
 def validate_instagram_reel_url(url: str) -> Dict[str, Any]:
-    """Validates Instagram Reel / Post URLs and extracts media shortcode."""
+    """Validates Instagram Reel / Post URLs and extracts media shortcode with SSRF protection."""
     if not url or not isinstance(url, str):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -35,6 +81,45 @@ def validate_instagram_reel_url(url: str) -> Dict[str, Any]:
         )
     
     clean_url = url.strip()
+    
+    try:
+        parsed = urlparse(clean_url)
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Malformed URL provided."
+        )
+
+    if parsed.scheme not in ["http", "https"]:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Invalid URL scheme. Only HTTP/HTTPS URLs are supported."
+        )
+
+    hostname = (parsed.hostname or "").lower()
+    if not hostname:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="URL hostname is missing or invalid."
+        )
+
+    # SSRF Protection: verify host is not private/loopback/link-local/metadata
+    if hostname in ["localhost", "127.0.0.1", "0.0.0.0", "::1", "metadata.google.internal"]:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Access to private or local network addresses is forbidden."
+        )
+
+    # If hostname is an IP address directly, check if private
+    try:
+        if is_ip_private_or_restricted(hostname):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Access to private or internal network addresses is forbidden."
+            )
+    except ValueError:
+        pass
+
     # Matches instagram.com/reel/CODE/, instagram.com/p/CODE/, or direct video files (.mp4/.mov)
     ig_pattern = r"(?:https?:\/\/)?(?:www\.)?instagram\.com\/(?:reel|p)\/([a-zA-Z0-9_-]+)"
     match = re.search(ig_pattern, clean_url)
@@ -47,10 +132,6 @@ def validate_instagram_reel_url(url: str) -> Dict[str, Any]:
     if clean_url.endswith((".mp4", ".mov", ".webm", ".m4v")) or "video" in clean_url.lower():
         return {"is_instagram": False, "shortcode": None, "url": clean_url}
         
-    # Check if standard http/https
-    if clean_url.startswith(("http://", "https://")):
-        return {"is_instagram": False, "shortcode": None, "url": clean_url}
-
     raise HTTPException(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         detail="Invalid URL format. Please provide an Instagram Reel link (e.g. https://www.instagram.com/reel/...) or video URL."
@@ -63,9 +144,25 @@ def create_url_analysis_job(
     url: str,
     declared_metrics: Optional[Dict[str, Any]] = None
 ) -> ReelAnalysisJob:
-    """Creates a new analysis job for a public Reel URL."""
+    """Creates a new analysis job for a public Reel URL with quota check and idempotency."""
     validated = validate_instagram_reel_url(url)
     
+    # Idempotency check: Return existing active or completed job if identical URL was recently submitted
+    existing_job = db.query(ReelAnalysisJob).filter(
+        ReelAnalysisJob.workspace_id == workspace_id,
+        ReelAnalysisJob.source_url == validated["url"],
+        ReelAnalysisJob.status.in_(["QUEUED", "INGESTING", "PROCESSING_VIDEO", "ANALYZING_METRICS", "GENERATING_AI_REPORT", "COMPLETED"])
+    ).order_by(ReelAnalysisJob.created_at.desc()).first()
+    if existing_job:
+        return existing_job
+
+    # Enforce AI analysis quota
+    if not check_and_increment_ai_quota(db, workspace_id):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Monthly Reel AI analysis quota exceeded for your workspace plan. Please upgrade your subscription."
+        )
+
     job = ReelAnalysisJob(
         workspace_id=workspace_id,
         analysis_mode="PUBLIC_URL",
@@ -87,11 +184,18 @@ def create_upload_analysis_job(
     workspace_id: str,
     file: UploadFile
 ) -> ReelAnalysisJob:
-    """Validates and stores uploaded video file, creating an analysis job."""
+    """Validates and stores uploaded video file, creating an analysis job with magic byte verification."""
     if file.content_type not in ALLOWED_VIDEO_MIMES:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Unsupported video format: '{file.content_type}'. Supported formats: MP4, MOV, WebM."
+        )
+
+    # Check quota
+    if not check_and_increment_ai_quota(db, workspace_id):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Monthly Reel AI analysis quota exceeded for your workspace plan. Please upgrade your subscription."
         )
 
     # Secure local workspace storage directory
@@ -101,9 +205,18 @@ def create_upload_analysis_job(
     safe_filename = f"{uuid.uuid4()}_{os.path.basename(file.filename or 'upload.mp4')}"
     file_path = os.path.join(workspace_media_dir, safe_filename)
 
+    # Read header for magic bytes inspection
+    header_chunk = file.file.read(64)
+    if not validate_video_file_magic_bytes(header_chunk):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Uploaded file signature does not match a valid, safe video stream."
+        )
+
     # Read and enforce file size constraint
-    file_size = 0
+    file_size = len(header_chunk)
     with open(file_path, "wb") as buffer:
+        buffer.write(header_chunk)
         while chunk := file.file.read(1024 * 1024):  # 1MB chunks
             file_size += len(chunk)
             if file_size > MAX_VIDEO_SIZE_BYTES:
@@ -152,7 +265,7 @@ def create_connected_reel_analysis_job(
     media_url: Optional[str] = None,
     thumbnail_url: Optional[str] = None
 ) -> ReelAnalysisJob:
-    """Creates an analysis job for a connected professional account Reel."""
+    """Creates an analysis job for a connected professional account Reel with idempotency and quota check."""
     account = db.query(InstagramAccount).filter(
         InstagramAccount.workspace_id == workspace_id,
         InstagramAccount.is_connected == True
@@ -162,6 +275,22 @@ def create_connected_reel_analysis_job(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="No connected Instagram professional account found for this workspace."
+        )
+
+    # Idempotency check: Return existing active or completed job if identical media was recently submitted
+    existing_job = db.query(ReelAnalysisJob).filter(
+        ReelAnalysisJob.workspace_id == workspace_id,
+        ReelAnalysisJob.source_media_id == media_id,
+        ReelAnalysisJob.status.in_(["QUEUED", "INGESTING", "PROCESSING_VIDEO", "ANALYZING_METRICS", "GENERATING_AI_REPORT", "COMPLETED"])
+    ).order_by(ReelAnalysisJob.created_at.desc()).first()
+    if existing_job:
+        return existing_job
+
+    # Quota check
+    if not check_and_increment_ai_quota(db, workspace_id):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Monthly Reel AI analysis quota exceeded for your workspace plan. Please upgrade your subscription."
         )
 
     job = ReelAnalysisJob(

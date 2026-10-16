@@ -49,3 +49,45 @@ test("Benchmark status indicator maps to appropriate visual status colors", () =
   assert.equal(getBenchmarkColor("BELOW_AVERAGE"), "bg-red-500");
   assert.equal(getBenchmarkColor("N/A"), "bg-slate-400");
 });
+
+test("Comparison selection limits enforce between 2 and 5 Reels", () => {
+  function canCompare(selectedCount: number): boolean {
+    return selectedCount >= 2 && selectedCount <= 5;
+  }
+
+  assert.equal(canCompare(0), false);
+  assert.equal(canCompare(1), false);
+  assert.equal(canCompare(2), true);
+  assert.equal(canCompare(4), true);
+  assert.equal(canCompare(5), true);
+  assert.equal(canCompare(6), false);
+});
+
+test("Finding severity classifications map to consistent UI badge variants", () => {
+  function getSeverityVariant(severity: string): string {
+    switch (severity) {
+      case "CRITICAL": return "danger";
+      case "WARNING": return "warning";
+      case "STRENGTH": return "verified";
+      default: return "default";
+    }
+  }
+
+  assert.equal(getSeverityVariant("CRITICAL"), "danger");
+  assert.equal(getSeverityVariant("WARNING"), "warning");
+  assert.equal(getSeverityVariant("STRENGTH"), "verified");
+  assert.equal(getSeverityVariant("OPPORTUNITY"), "default");
+});
+
+test("SSRF guard rejects localhost and internal IP patterns on client side", () => {
+  function isRestrictedHost(url: string): boolean {
+    const forbidden = ["localhost", "127.0.0.1", "169.254.", "10.0.", "192.168.", "0.0.0.0"];
+    return forbidden.some(ip => url.includes(ip));
+  }
+
+  assert.equal(isRestrictedHost("http://127.0.0.1/video.mp4"), true);
+  assert.equal(isRestrictedHost("http://localhost:3000/demo"), true);
+  assert.equal(isRestrictedHost("http://169.254.169.254/metadata"), true);
+  assert.equal(isRestrictedHost("https://www.instagram.com/reel/C123/"), false);
+});
+

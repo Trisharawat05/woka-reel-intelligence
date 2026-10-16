@@ -115,14 +115,30 @@ def extract_video_metadata_and_frames(
             prev_gray = gray
 
             # Safe Zone Hazard Check: Instagram Reel overlays
-            # Bottom 20% contains captions and sound title; Right 15% has action buttons
-            bottom_zone = gray[int(height * 0.80):, :]
-            right_zone = gray[:, int(width * 0.85):]
+            # Bottom 20% contains captions and sound title; Right 18% has action buttons
+            bottom_zone = gray[int(height * 0.78):, :]
+            right_zone = gray[:, int(width * 0.82):]
             
             # High edge energy in obstructed zones indicates text/graphics risked being covered
             edges_bottom = cv2.Canny(bottom_zone, 80, 180)
             if float(np.mean(edges_bottom)) > 15.0:
                 safe_zone_hazard_count += 1
+
+            # OCR / Text line candidate detection using morphological horizontal gradient
+            # Connects horizontally adjacent character glyphs in middle reading zone
+            grad_x = cv2.Sobel(gray, cv2.CV_16S, 1, 0, ksize=3)
+            abs_grad_x = cv2.convertScaleAbs(grad_x)
+            _, thresh = cv2.threshold(abs_grad_x, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (17, 3))
+            connected = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+            contours, _ = cv2.findContours(connected, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            for cnt in contours:
+                x, y, w, h = cv2.boundingRect(cnt)
+                if w > (width * 0.15) and h > 12 and (w / max(1, h)) >= 2.0:
+                    # Bounding box matches a line of text/subtitle
+                    if y > int(height * 0.78) or (x + w) > int(width * 0.82):
+                        safe_zone_hazard_count += 1
 
         frame_idx += 1
 
@@ -136,6 +152,8 @@ def extract_video_metadata_and_frames(
 
     is_safe_vertical = (aspect_ratio_label == "9:16")
     lighting_quality = "OPTIMAL" if 85.0 <= avg_brightness <= 180.0 else ("UNDEREXPOSED" if avg_brightness < 85.0 else "OVEREXPOSED")
+    hazard_ratio = round(safe_zone_hazard_count / max(1, sampled_frame_count), 2)
+    subtitle_readability = max(40.0, min(98.0, round(95.0 - (hazard_ratio * 120.0), 1)))
 
     return {
         "duration_seconds": duration_seconds,
@@ -151,7 +169,8 @@ def extract_video_metadata_and_frames(
         "avg_brightness": avg_brightness,
         "lighting_quality": lighting_quality,
         "avg_contrast": avg_contrast,
-        "safe_zone_hazard_ratio": round(safe_zone_hazard_count / max(1, sampled_frame_count), 2),
+        "safe_zone_hazard_ratio": hazard_ratio,
+        "subtitle_readability_score": subtitle_readability,
         "static_visual_ratio": round(static_motion_frames / max(1, sampled_frame_count), 2),
         "thumbnail_filename": thumbnail_rel_path,
         "is_simulated": False
@@ -185,6 +204,7 @@ def generate_simulated_video_metrics(source_identifier: str, output_thumbnail_di
         "lighting_quality": "OPTIMAL",
         "avg_contrast": 54.2,
         "safe_zone_hazard_ratio": 0.08,
+        "subtitle_readability_score": 88.0,
         "static_visual_ratio": 0.04,
         "thumbnail_filename": None,
         "is_simulated": True

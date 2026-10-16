@@ -1,6 +1,6 @@
-from datetime import datetime
-from typing import Optional
-from pydantic import BaseModel, ConfigDict
+from datetime import datetime, timezone
+from typing import Optional, List, Dict, Any
+from pydantic import BaseModel, ConfigDict, Field
 
 class InstagramAccountResponse(BaseModel):
     id: str
@@ -14,17 +14,53 @@ class InstagramAccountResponse(BaseModel):
     followers_count: int
     media_count: int
     token_expires_at: Optional[datetime] = None
+    granted_permissions: Optional[str] = None
+    is_token_expired: Optional[bool] = False
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
 
+
 class InstagramOAuthURLResponse(BaseModel):
     oauth_url: str
     state: str
+    scopes_requested: List[str]
+    expires_in_seconds: int = 900
+
 
 class InstagramConnectRequest(BaseModel):
-    code: str
-    state: str
+    code: str = Field(..., description="Authorization code from Meta OAuth redirect")
+    state: str = Field(..., description="HMAC-signed CSRF state parameter")
+
+
+class InstagramStatusResponse(BaseModel):
+    is_connected: bool
+    account: Optional[InstagramAccountResponse] = None
+    has_insights_permission: bool = False
+    token_status: str = "ACTIVE"  # "ACTIVE", "EXPIRED", "REVOKED", "MISSING"
+    api_version: str = "v21.0"
+    message: Optional[str] = None
+
+
+class InstagramSyncInsightsResponse(BaseModel):
+    status: str  # "SUCCESS", "PARTIAL", "FAILED"
+    synced_media_count: int
+    metric_snapshots_created: int
+    synced_at: datetime
+    provenance: Dict[str, Any]
+    errors: List[str] = []
+
+
+class InstagramDisconnectResponse(BaseModel):
+    status: str
+    message: str
+
+
+class InstagramRefreshTokenResponse(BaseModel):
+    status: str
+    token_expires_at: Optional[datetime] = None
+    message: str
+
 
 class InstagramSandboxToggleRequest(BaseModel):
     enabled: bool = True

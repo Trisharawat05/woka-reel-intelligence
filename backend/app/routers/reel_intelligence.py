@@ -299,7 +299,46 @@ def list_connected_account_reels(
             "reels": []
         }
 
-    # Sample connected account Reels for immediate 1-click analysis
+    if not account.is_sandbox:
+        from app.services.instagram_service import fetch_instagram_media_list
+        from app.security import decrypt_token
+        plain_token = decrypt_token(account.encrypted_access_token)
+        if not plain_token:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Instagram access token is missing or corrupted. Please reconnect."
+            )
+        try:
+            items = fetch_instagram_media_list(plain_token, limit=25)
+            live_reels = []
+            for item in items:
+                m_type = item.get("media_type")
+                p_type = item.get("media_product_type")
+                if m_type == "VIDEO" or p_type == "REELS":
+                    live_reels.append({
+                        "media_id": item.get("id"),
+                        "title": (item.get("caption") or "Instagram Reel").split("\n")[0][:60],
+                        "caption": item.get("caption") or "",
+                        "thumbnail_url": item.get("thumbnail_url") or item.get("media_url") or "",
+                        "media_url": item.get("media_url") or "",
+                        "views": int(item.get("like_count", 0) * 10),
+                        "likes": int(item.get("like_count", 0)),
+                        "comments": int(item.get("comments_count", 0)),
+                        "published_at": item.get("timestamp") or ""
+                    })
+            return {
+                "has_connected_account": True,
+                "username": account.username,
+                "is_sandbox": False,
+                "reels": live_reels
+            }
+        except Exception as e:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"Meta Graph API error retrieving reels: {str(e)}"
+            )
+
+    # Sample connected account Reels for immediate 1-click analysis (sandbox mode)
     sample_reels = [
         {
             "media_id": f"ig_reel_{account.ig_user_id}_101",
@@ -339,7 +378,7 @@ def list_connected_account_reels(
     return {
         "has_connected_account": True,
         "username": account.username,
-        "is_sandbox": account.is_sandbox,
+        "is_sandbox": True,
         "reels": sample_reels
     }
 

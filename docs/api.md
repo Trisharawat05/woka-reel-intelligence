@@ -110,3 +110,46 @@ Returns list of past reports in the workspace.
 ### 2.8 Retry Failed Analysis
 `POST /api/v1/reel-intelligence/jobs/{job_id}/retry`  
 Resets failed job to `QUEUED` and re-initiates the pipeline.
+
+---
+
+## 3. Instagram Integration Endpoints (`/instagram`)
+
+Official Meta Graph API (v21.0) Instagram Login for Business integration routes.
+
+### 3.1 Connection Status
+`GET /api/v1/instagram/status`  
+Returns connection status, token health (`ACTIVE`, `EXPIRED`, `REVOKED`, `MISSING`), expiration metadata, and permission verification.
+
+### 3.2 Get OAuth Authorization URL
+`GET /api/v1/instagram/oauth-url`  
+Returns Meta authorization URL with CSRF-protected HMAC-SHA256 state and requested scopes (`instagram_business_basic`, `instagram_business_manage_insights`).
+
+### 3.3 Connect Account (OAuth Code Exchange)
+`POST /api/v1/instagram/connect`  
+**Request:**
+```json
+{
+  "code": "meta_auth_code_from_redirect",
+  "state": "hmac_signed_state_parameter"
+}
+```
+Exchanges authorization code for a short-lived token, converts to a 60-day long-lived token, encrypts with Fernet AES-256 at rest, and persists account metadata.
+
+### 3.4 Sync Insights
+`POST /api/v1/instagram/sync-insights`  
+Pulls latest profile information and Reel media insights (`reach`, `saved`, `shares`, `total_interactions`) from Meta Graph API. Persists snapshots to `reel_metric_snapshots` with full provenance metadata. Enforces tenant ownership and never fabricates live metrics on failure.
+
+### 3.5 Refresh Access Token
+`POST /api/v1/instagram/refresh-token`  
+Refreshes the long-lived 60-day access token before expiry via `graph.instagram.com/refresh_access_token`.
+
+### 3.6 Disconnect Account
+`POST /api/v1/instagram/disconnect`  
+Clears encrypted access tokens, revokes active connection status, and returns `{"status": "DISCONNECTED"}`.
+
+### 3.7 Webhooks & Compliance Callbacks
+- `GET /api/v1/instagram/webhook`: Webhook challenge handshake verification.
+- `POST /api/v1/instagram/webhook`: Inbound webhook events (e.g. comments, messages).
+- `POST /api/v1/instagram/deauthorize`: Meta deauthorization notification callback.
+- `POST /api/v1/instagram/data-deletion`: Meta GDPR/user data deletion request callback.

@@ -18,6 +18,7 @@ class InstagramAccount(Base):
     profile_pic_url = Column(Text, nullable=True)
     encrypted_access_token = Column(Text, nullable=False)
     token_expires_at = Column(DateTime(timezone=True), nullable=True)
+    granted_permissions = Column(Text, nullable=True, default="instagram_business_basic,instagram_business_manage_insights")
     is_connected = Column(Boolean, nullable=False, default=True)
     is_sandbox = Column(Boolean, nullable=False, default=False)
     followers_count = Column(Integer, nullable=False, default=0)
@@ -28,3 +29,13 @@ class InstagramAccount(Base):
     # Relationships
     workspace = relationship("Workspace", back_populates="instagram_accounts")
     automations = relationship("Automation", back_populates="instagram_account", cascade="all, delete-orphan")
+
+    @property
+    def is_token_expired(self) -> bool:
+        if not self.token_expires_at:
+            return False
+        now = datetime.now(timezone.utc)
+        exp = self.token_expires_at
+        if exp.tzinfo is None:
+            exp = exp.replace(tzinfo=timezone.utc)
+        return exp < now

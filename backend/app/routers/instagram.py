@@ -5,7 +5,16 @@ from typing import Optional
 from app.database import get_db
 from app.config import settings
 from app.models.user import User
-from app.schemas.instagram import InstagramAccountResponse, InstagramOAuthURLResponse, InstagramConnectRequest, InstagramSandboxToggleRequest
+from app.schemas.instagram import (
+    InstagramAccountResponse,
+    InstagramOAuthURLResponse,
+    InstagramConnectRequest,
+    InstagramStatusResponse,
+    InstagramSyncInsightsResponse,
+    InstagramDisconnectResponse,
+    InstagramRefreshTokenResponse,
+    InstagramSandboxToggleRequest
+)
 from app.services.auth_service import get_or_create_workspace
 from app.services.instagram_service import (
     get_oauth_authorization_url,
@@ -14,12 +23,24 @@ from app.services.instagram_service import (
     verify_meta_webhook_signature,
     verify_oauth_state,
     process_incoming_webhook_event,
-    parse_meta_signed_request
+    parse_meta_signed_request,
+    connect_or_update_account_from_oauth,
+    sync_connected_account_insights,
+    disconnect_instagram_account,
+    get_instagram_connection_status,
+    refresh_workspace_instagram_token
 )
 from app.models.instagram import InstagramAccount
 from app.security import get_current_user
 
 router = APIRouter(prefix="/instagram", tags=["Instagram Integration"])
+
+@router.get("/status", response_model=InstagramStatusResponse)
+def get_status(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Retrieves the connected Instagram account status, token health, and permissions."""
+    workspace = get_or_create_workspace(db, current_user)
+    status_data = get_instagram_connection_status(db, workspace.id)
+    return status_data
 
 @router.get("/account", response_model=Optional[InstagramAccountResponse])
 def get_account(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
@@ -33,28 +54,42 @@ def get_account(current_user: User = Depends(get_current_user), db: Session = De
 def get_oauth_url(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     workspace = get_or_create_workspace(db, current_user)
     data = get_oauth_authorization_url(workspace.id)
-    return InstagramOAuthURLResponse(oauth_url=data["oauth_url"], state=data["state"])
+    return InstagramOAuthURLResponse(**data)
 
 @router.post("/connect", response_model=InstagramAccountResponse)
 def connect_account(payload: InstagramConnectRequest, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Exchanges Meta authorization code and binds Instagram account to workspace."""
     workspace = get_or_create_workspace(db, current_user)
-    if not verify_oauth_state(payload.state, workspace.id, db=db):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid or expired OAuth state parameter (CSRF protection failed)"
-        )
-    account = toggle_sandbox_account(db, workspace.id, enabled=True, username="creator_woka_live")
+    account = connect_or_update_account_from_oauth(db, workspace.id, payload.code, payload.state)
     return InstagramAccountResponse.model_validate(account)
 
-@router.post("/disconnect")
-def disconnect_account(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+@router.post("/callback", response_model=InstagramAccountResponse)
+def oauth_callback(payload: InstagramConnectRequest, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Alternative callback handler for OAuth authorization code exchange."""
     workspace = get_or_create_workspace(db, current_user)
-    account = get_connected_account(db, workspace.id)
-    if account:
-        account.is_connected = False
-        account.encrypted_access_token = ""
-        db.commit()
-    return {"status": "DISCONNECTED", "message": "Instagram account has been disconnected"}
+    account = connect_or_update_account_from_oauth(db, workspace.id, payload.code, payload.state)
+    return InstagramAccountResponse.model_validate(account)
+
+@router.post("/sync-insights", response_model=InstagramSyncInsightsResponse)
+def sync_insights(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Synchronizes live Reel insights from Meta Graph API without data fabrication."""
+    workspace = get_or_create_workspace(db, current_user)
+    result = sync_connected_account_insights(db, workspace.id)
+    return result
+
+@router.post("/disconnect", response_model=InstagramDisconnectResponse)
+def disconnect_account(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Disconnects Instagram account, wipes tokens, and revokes access."""
+    workspace = get_or_create_workspace(db, current_user)
+    result = disconnect_instagram_account(db, workspace.id)
+    return result
+
+@router.post("/refresh-token", response_model=InstagramRefreshTokenResponse)
+def refresh_token(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Refreshes long-lived 60-day Instagram access token."""
+    workspace = get_or_create_workspace(db, current_user)
+    result = refresh_workspace_instagram_token(db, workspace.id)
+    return result
 
 @router.post("/sandbox/toggle", response_model=InstagramAccountResponse)
 def toggle_sandbox(payload: InstagramSandboxToggleRequest, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):

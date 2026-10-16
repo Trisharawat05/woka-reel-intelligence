@@ -31,6 +31,8 @@ class Settings(BaseSettings):
     META_APP_SECRET: str = Field(default="mock_meta_app_secret_67890", description="Meta Developer App Secret")
     META_VERIFY_TOKEN: str = Field(default="woka_meta_webhook_verify_token_2026", description="Webhook handshake token")
     META_REDIRECT_URI: str = Field(default="http://localhost:3000/dashboard/instagram/callback", description="OAuth callback URI")
+    META_API_VERSION: str = Field(default="v21.0", description="Meta Graph API version (e.g. v21.0)")
+    FRONTEND_URL: str = Field(default="http://localhost:3000", description="Frontend application URL")
 
     # CORS
     CORS_ORIGINS: List[str] = [
@@ -58,6 +60,12 @@ class Settings(BaseSettings):
                 raise ValueError("CRITICAL SECURITY VIOLATION: Default SECRET_KEY cannot be used in production environment.")
             if self.TOKEN_ENCRYPTION_KEY == default_fernet:
                 raise ValueError("CRITICAL SECURITY VIOLATION: Default TOKEN_ENCRYPTION_KEY cannot be used in production environment.")
+            if not self.META_APP_ID or self.META_APP_ID.startswith("mock_"):
+                raise ValueError("CRITICAL CONFIGURATION ERROR: Valid META_APP_ID must be configured for production.")
+            if not self.META_APP_SECRET or self.META_APP_SECRET.startswith("mock_"):
+                raise ValueError("CRITICAL CONFIGURATION ERROR: Valid META_APP_SECRET must be configured for production.")
+            if not self.META_REDIRECT_URI or "localhost" in self.META_REDIRECT_URI:
+                raise ValueError("CRITICAL CONFIGURATION ERROR: Valid META_REDIRECT_URI must be configured for production.")
         return self
 
 settings = Settings()

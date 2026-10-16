@@ -142,26 +142,51 @@ The backend application provides explicit liveness and readiness endpoints for K
 
 To enable staging authorization and insights synchronization:
 
-### 1. Register Staging Redirect URIs
-In the [Meta for Developers Portal](https://developers.facebook.com/) under **Instagram Login for Business > Settings**:
-- `https://staging.woka.io/dashboard/instagram/callback`
-- `https://api-staging.woka.io/api/v1/instagram/callback`
+### 1. Canonical OAuth Callback Architecture
+Woka Reel Intelligence implements a direct, secure backend OAuth redirect architecture:
 
-### 2. Configure Compliance Callbacks
-Under App Settings > Basic:
-- **Data Deletion Callback URL**: `https://api-staging.woka.io/api/v1/instagram/data-deletion`
-- **Deauthorize Callback URL**: `https://api-staging.woka.io/api/v1/instagram/deauthorize`
+```
+[User Browser] ---> (Clicks Connect) ---> [FastAPI: GET /api/v1/instagram/oauth-url]
+                                                           |
+[User Browser] <--- (Redirects to Meta Dialog) <-----------+ (Contains redirect_uri=https://woka-api-staging.onrender.com/api/v1/instagram/callback)
+      |
+[Meta Auth Dialog] (User grants instagram_business_basic & instagram_business_manage_insights)
+      |
+[Meta API] -------> (Redirects with code & HMAC state) ---> [FastAPI: GET /api/v1/instagram/callback]
+                                                                      |
+                                                               (Validates HMAC & single-use nonce)
+                                                               (Exchanges code -> short -> 60-day token)
+                                                               (Encrypts token with AES-256 Fernet)
+                                                               (Persists InstagramAccount in DB)
+                                                                      |
+[User Browser] <--- (HTTP 302 Redirect: /dashboard/instagram?connected=true) -+
+```
 
-### 3. Configure Webhooks
+### 2. Register Staging Redirect URIs
+In the [Meta for Developers Portal](https://developers.facebook.com/) under **Instagram Login for Business > Settings > Valid OAuth Redirect URIs**:
+- **Primary Canonical Backend Callback**: `https://woka-api-staging.onrender.com/api/v1/instagram/callback`
+- **Frontend Callback Fallback**: `https://woka-staging.vercel.app/dashboard/instagram/callback`
+- **Local Dev Callback**: `http://localhost:8000/api/v1/instagram/callback`
+
+> [!IMPORTANT]
+> The environment variable `META_REDIRECT_URI` configured in Render MUST match the registered callback URI character-for-character. The token exchange POST request to `https://api.instagram.com/oauth/access_token` verifies exact matching against the initial authorization request.
+
+### 3. Configure Compliance Callbacks
+Under **App Settings > Basic**:
+- **Data Deletion Callback URL**: `https://woka-api-staging.onrender.com/api/v1/instagram/data-deletion`
+- **Deauthorize Callback URL**: `https://woka-api-staging.onrender.com/api/v1/instagram/deauthorize`
+
+### 4. Configure Webhooks
 Under **Instagram > Webhooks**:
-- **Callback URL**: `https://api-staging.woka.io/api/v1/instagram/webhook`
-- **Verify Token**: Matching `META_VERIFY_TOKEN` (e.g. `woka_staging_meta_webhook_verify_token_2026`)
+- **Callback URL**: `https://woka-api-staging.onrender.com/api/v1/instagram/webhook`
+- **Verify Token**: Matching `META_VERIFY_TOKEN` (e.g. generated in Render Blueprint)
 - **Subscribed Fields**: `comments`, `messages`
 
-### 4. Assign Tester Accounts
-If the Meta App has not completed formal App Review:
-- Add staging test Instagram accounts under **Roles > Test Users** or **Roles > Instagram Testers**.
-- Have each tester accept the invitation at `instagram.com/accounts/manage_access`.
+### 5. Assign Tester Accounts
+While in **Development Mode** (prior to Meta App Review):
+- Add staging test Instagram accounts under **App Roles > Roles > Instagram Testers**.
+- Have each tester log in to Instagram (web or app), navigate to **Settings > Apps and Websites > Tester Invites**, and click **Accept**.
+- Test accounts MUST be Instagram Professional (Creator or Business) accounts.
 
 ---
 
@@ -171,18 +196,18 @@ Run these verification steps immediately after staging deployment:
 
 ### Test 1: Container Health Probes
 ```bash
-# Liveness
-curl -i https://api-staging.woka.io/healthz
+# Liveness Probe
+curl -i https://woka-api-staging.onrender.com/healthz
 # Expected: HTTP 200 {"status": "alive"}
 
-# Readiness (with DB Ping)
-curl -i https://api-staging.woka.io/readyz
-# Expected: HTTP 200 {"status": "ready", "database": "connected"}
+# Readiness Probe (with live DB Ping)
+curl -i https://woka-api-staging.onrender.com/readyz
+# Expected: HTTP 200 {"status": "ready", "database": "connected", "version": "1.0.0"}
 ```
 
 ### Test 2: Authentication & Workspace Creation
 ```bash
-curl -i -X POST https://api-staging.woka.io/api/v1/auth/register \
+curl -i -X POST https://woka-api-staging.onrender.com/api/v1/auth/register \
   -H "Content-Type: application/json" \
   -d '{
     "email": "smoke-tester@woka.io",
@@ -196,7 +221,7 @@ curl -i -X POST https://api-staging.woka.io/api/v1/auth/register \
 ### Test 3: Public Reel Analysis Pipeline
 ```bash
 # Submit job
-curl -i -X POST https://api-staging.woka.io/api/v1/reel-intelligence/jobs/url \
+curl -i -X POST https://woka-api-staging.onrender.com/api/v1/reel-intelligence/jobs/url \
   -H "Authorization: Bearer <TOKEN>" \
   -H "Content-Type: application/json" \
   -d '{
@@ -204,44 +229,57 @@ curl -i -X POST https://api-staging.woka.io/api/v1/reel-intelligence/jobs/url \
     "declared_views": 18500
   }'
 # Expected: HTTP 202 Accepted with job status "QUEUED"
-
-# Poll status
-curl -i https://api-staging.woka.io/api/v1/reel-intelligence/jobs/<JOB_ID> \
-  -H "Authorization: Bearer <TOKEN>"
-# Expected: Progress progresses 15% -> 45% -> 70% -> 100% ("COMPLETED") with report_id
 ```
 
-### Test 4: Video Upload Magic Bytes & Anti-Malware Validation
+### Test 4: Video Upload Magic Bytes Validation
 ```bash
 # Upload disguised binary (must reject)
-curl -i -X POST https://api-staging.woka.io/api/v1/reel-intelligence/jobs/upload \
+curl -i -X POST https://woka-api-staging.onrender.com/api/v1/reel-intelligence/jobs/upload \
   -H "Authorization: Bearer <TOKEN>" \
   -F "file=@fake_video.mp4;type=video/mp4"
 # Expected: HTTP 422 Unprocessable Content (Magic bytes validation failed)
 ```
 
 ### Test 5: Meta Instagram Login OAuth & Insights Sync
-1. Open `https://staging.woka.io/dashboard/instagram` in a browser.
+1. Open `https://woka-staging.vercel.app/dashboard/instagram` in a browser.
 2. Click **Connect via Meta OAuth**.
-3. Verify the browser redirects to `https://www.instagram.com/oauth/authorize` or `https://www.facebook.com/v21.0/dialog/oauth`.
+3. Verify redirect to Meta consent dialog showing `instagram_business_basic` and `instagram_business_manage_insights`.
 4. Authorize with the Meta Tester Account.
-5. Confirm redirect to `https://staging.woka.io/dashboard/instagram?connected=true&username=...`.
-6. Click **Sync Insights Now** and verify that Reel metric snapshots are retrieved and stored.
+5. Confirm redirect to `https://woka-staging.vercel.app/dashboard/instagram?connected=true&username=...`.
+6. Click **Sync Insights Now** and verify metric snapshots populate.
 7. Click **Refresh 60-Day Token** and verify expiration updates.
-8. Click **Disconnect Account** and verify access tokens are securely expunged.
+8. Click **Disconnect Account** and verify access tokens are zeroized from the database.
 
 ---
 
-## 7. Rollback Strategy
+## 7. Rollback & Migration Safety Strategy
 
-If critical defects or telemetry regressions are identified:
+### 7.1 Traffic & Service Rollback
+If critical defects or telemetry regressions occur:
+1. **Frontend (Vercel)**:
+   - Navigate to Vercel Dashboard > Project > Deployments.
+   - Click **...** next to previous stable deployment > **Promote to Production** (takes effect in <5s).
+2. **Backend (Render)**:
+   - Navigate to Render Dashboard > `woka-api-staging` > Deploys.
+   - Click **Rollback to this deploy** on the previous stable commit.
 
-1. **Traffic Rollback**: Revert DNS/Load Balancer target to the previous container revision:
-   - AWS ECS: `aws ecs update-service --cluster woka-staging --service woka-api --task-definition woka-api:PREVIOUS_REVISION`
-   - GCP Cloud Run: `gcloud run services update-traffic woka-api --to-revisions=PREVIOUS_REVISION=100`
-   - Vercel (Frontend): Roll back to previous deployment alias in the Vercel dashboard.
-2. **Database Rollback**: If the release included backwards-incompatible migrations:
+### 7.2 Database Migration Safety & Rollback Warning
+> [!CAUTION]
+> **NEVER blindly run `alembic downgrade -1` in staging or production.**
+> Inspect the target revision before executing downgrades:
+> - Revision `c8194ad51e7f` &rarr; drops `granted_permissions` column from `instagram_accounts`.
+> - Revision `bd03f60aa48b` &rarr; **DROPS ALL 5 REEL INTELLIGENCE TABLES** (`reel_comparisons`, `reel_metric_snapshots`, `reel_analysis_jobs`, `reel_reports`, `reel_media_assets`), permanently destroying all historical reports!
+
+#### Safe Migration Rollback Protocol:
+1. **Pre-Rollback Database Backup**:
+   Always take a database snapshot or run `pg_dump` before performing schema downgrades:
    ```bash
-   python -m alembic downgrade <target_revision>
+   pg_dump "$DATABASE_URL" > pre_rollback_backup_$(date +%s).sql
    ```
-3. **Meta OAuth Tokens**: Tokens encrypted with the existing `TOKEN_ENCRYPTION_KEY` remain readable after rollback as long as the encryption key is unchanged.
+2. **Targeted Revision Downgrade**:
+   Specify the exact revision identifier instead of relative offsets:
+   ```bash
+   python -m alembic downgrade bd03f60aa48b
+   ```
+3. **Additive-First Philosophy**:
+   For schema changes, prefer backwards-compatible additive migrations over column/table drops to permit zero-downtime rollbacks without database destruction.

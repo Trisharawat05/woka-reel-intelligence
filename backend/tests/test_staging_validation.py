@@ -233,3 +233,37 @@ def test_staging_upload_malware_magic_bytes_protection(client, auth_headers):
     )
     assert res_fake.status_code == 422
     assert "signature does not match" in res_fake.json()["detail"].lower()
+
+
+def test_database_url_postgres_normalization():
+    """Verifies postgres:// URL prefix from Render is normalized to postgresql:// for SQLAlchemy."""
+    from app.config import Settings
+    custom_settings = Settings(DATABASE_URL="postgres://user:pass@host.render.internal:5432/woka_staging")
+    assert custom_settings.DATABASE_URL.startswith("postgresql://")
+    assert custom_settings.DATABASE_URL == "postgresql://user:pass@host.render.internal:5432/woka_staging"
+
+
+def test_cors_origins_and_frontend_url_auto_whitelist():
+    """Verifies comma-separated CORS origins and auto-whitelisting of FRONTEND_URL."""
+    from app.config import Settings
+    custom = Settings(
+        CORS_ORIGINS="https://woka-staging.vercel.app, https://staging.woka.io",
+        FRONTEND_URL="https://preview-123.vercel.app"
+    )
+    assert "https://woka-staging.vercel.app" in custom.CORS_ORIGINS
+    assert "https://staging.woka.io" in custom.CORS_ORIGINS
+    # FRONTEND_URL must be automatically added
+    assert "https://preview-123.vercel.app" in custom.CORS_ORIGINS
+
+
+def test_oauth_connect_with_explicit_redirect_uri(client, auth_headers, test_creator_user):
+    """Verifies /api/v1/instagram/connect accepts and processes optional redirect_uri."""
+    user, ws = test_creator_user
+    state = generate_oauth_state(ws.id)
+    res = client.post("/api/v1/instagram/connect", json={
+        "code": "mock_code_123",
+        "state": state,
+        "redirect_uri": "https://woka-staging.vercel.app/dashboard/instagram/callback"
+    }, headers=auth_headers)
+    assert res.status_code == 200
+    assert res.json()["is_connected"] is True

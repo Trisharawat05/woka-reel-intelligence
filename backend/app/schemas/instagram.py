@@ -31,6 +31,7 @@ class InstagramOAuthURLResponse(BaseModel):
 class InstagramConnectRequest(BaseModel):
     code: str = Field(..., description="Authorization code from Meta OAuth redirect")
     state: str = Field(..., description="HMAC-signed CSRF state parameter")
+    redirect_uri: Optional[str] = Field(default=None, description="Optional redirect URI matching the authorization request")
 
 
 class InstagramStatusResponse(BaseModel):

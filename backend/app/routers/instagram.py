@@ -109,14 +109,14 @@ def oauth_get_callback(
 def connect_account(payload: InstagramConnectRequest, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """Exchanges Meta authorization code and binds Instagram account to workspace."""
     workspace = get_or_create_workspace(db, current_user)
-    account = connect_or_update_account_from_oauth(db, workspace.id, payload.code, payload.state)
+    account = connect_or_update_account_from_oauth(db, workspace.id, payload.code, payload.state, redirect_uri=payload.redirect_uri)
     return InstagramAccountResponse.model_validate(account)
 
 @router.post("/callback", response_model=InstagramAccountResponse)
 def oauth_callback(payload: InstagramConnectRequest, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """Alternative callback handler for OAuth authorization code exchange."""
     workspace = get_or_create_workspace(db, current_user)
-    account = connect_or_update_account_from_oauth(db, workspace.id, payload.code, payload.state)
+    account = connect_or_update_account_from_oauth(db, workspace.id, payload.code, payload.state, redirect_uri=payload.redirect_uri)
     return InstagramAccountResponse.model_validate(account)
 
 @router.post("/sync-insights", response_model=InstagramSyncInsightsResponse)
@@ -221,7 +221,7 @@ async def meta_data_deletion_callback(request: Request, db: Session = Depends(ge
             db.commit()
 
     return {
-        "url": f"https://app.woka.io/deletion-status?code={confirmation_code}",
+        "url": f"{settings.FRONTEND_URL}/deletion-status?code={confirmation_code}",
         "confirmation_code": confirmation_code
     }
 

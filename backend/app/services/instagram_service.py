@@ -438,7 +438,13 @@ def fetch_media_insights(access_token: str, media_id: str) -> dict:
 # Connection & Synchronization Domain Operations
 # ==============================================================================
 
-def connect_or_update_account_from_oauth(db: Session, workspace_id: str, code: str, state: str) -> InstagramAccount:
+def connect_or_update_account_from_oauth(
+    db: Session,
+    workspace_id: str,
+    code: str,
+    state: str,
+    redirect_uri: Optional[str] = None
+) -> InstagramAccount:
     """
     Validates CSRF state, exchanges authorization code for long-lived tokens,
     retrieves user profile, encrypts token at rest, and persists/updates InstagramAccount.
@@ -455,7 +461,7 @@ def connect_or_update_account_from_oauth(db: Session, workspace_id: str, code: s
 
     # Live Meta code exchange
     try:
-        token_data = exchange_code_for_tokens(code)
+        token_data = exchange_code_for_tokens(code, redirect_uri=redirect_uri)
     except MetaAPIError as e:
         if settings.META_APP_ID.startswith("mock_"):
             return toggle_sandbox_account(db, workspace_id, enabled=True, username="creator_woka_live")

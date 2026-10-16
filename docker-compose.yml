@@ -1,0 +1,35 @@
+version: "3.8"
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: woka-backend
+    ports:
+      - "8000:8000"
+    environment:
+      - ENVIRONMENT=production
+      - DATABASE_URL=sqlite:///./woka.db
+      - SECRET_KEY=woka-super-secret-production-grade-signing-key-32chars-min!
+      - TOKEN_ENCRYPTION_KEY=eF9rVlBfZkRzQ3ZfU0VDUkVUX0tFWV8xMjM0NTY3ODk=
+      - META_APP_ID=mock_meta_app_id_12345
+      - META_APP_SECRET=mock_meta_app_secret_67890
+      - META_VERIFY_TOKEN=woka_meta_webhook_verify_token_2026
+    volumes:
+      - backend-data:/app/data
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: woka-frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8000/api/v1
+    depends_on:
+      - backend
+
+volumes:
+  backend-data:

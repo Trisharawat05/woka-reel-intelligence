@@ -15,7 +15,8 @@ from app.routers import (
     invoices,
     subscriptions,
     notifications,
-    admin
+    admin,
+    reel_intelligence
 )
 
 # Initialize database tables
@@ -51,6 +52,7 @@ app.include_router(invoices.router, prefix=settings.API_V1_STR)
 app.include_router(subscriptions.router, prefix=settings.API_V1_STR)
 app.include_router(notifications.router, prefix=settings.API_V1_STR)
 app.include_router(admin.router, prefix=settings.API_V1_STR)
+app.include_router(reel_intelligence.router, prefix=settings.API_V1_STR)
 
 @app.get("/api/health", tags=["Health"])
 def health_check():

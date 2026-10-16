@@ -8,6 +8,13 @@ from app.models.campaign import BrandCampaign, CampaignApplication, CampaignDeli
 from app.models.invoice import Invoice
 from app.models.subscription import Subscription
 from app.models.notification import Notification
+from app.models.reel_intelligence import (
+    ReelMediaAsset,
+    ReelAnalysisJob,
+    ReelMetricSnapshot,
+    ReelReport,
+    ReelComparison
+)
 
 __all__ = [
     "Base",
@@ -26,5 +33,11 @@ __all__ = [
     "CampaignDeliverable",
     "Invoice",
     "Subscription",
-    "Notification"
+    "Notification",
+    "ReelMediaAsset",
+    "ReelAnalysisJob",
+    "ReelMetricSnapshot",
+    "ReelReport",
+    "ReelComparison"
 ]
+

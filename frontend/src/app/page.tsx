@@ -16,7 +16,8 @@ import {
   Play,
   Calculator,
   Flame,
-  Award
+  Award,
+  Film
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -37,11 +38,11 @@ export default function LandingPage() {
       <div className="bg-slate-900 px-4 py-2 text-center text-xs text-slate-300">
         <span className="inline-flex items-center gap-1.5 font-medium">
           <Badge variant="sandbox" className="text-[10px] py-0 px-1.5">
-            Meta Graph API Ready
+            New: Reel Intelligence
           </Badge>
-          Compliant Instagram Comment-to-DM automation & Verified Media Kits.
-          <Link href="/login" className="text-violet-400 hover:underline font-semibold ml-1">
-            Try Demo Workspace &rarr;
+          AI-Powered Instagram Reel Video Pacing, Hook Strength & 8-Dimension Auditing.
+          <Link href="/dashboard/reel-intelligence" className="text-violet-400 hover:underline font-semibold ml-1">
+            Analyze a Reel &rarr;
           </Link>
         </span>
       </div>
@@ -62,6 +63,9 @@ export default function LandingPage() {
           </Link>
 
           <nav className="hidden md:flex items-center gap-8 text-sm font-medium text-slate-600">
+            <Link href="/dashboard/reel-intelligence" className="hover:text-slate-900 transition-colors flex items-center gap-1.5 font-semibold text-violet-600">
+              <Film className="h-4 w-4" /> Reel Intelligence
+            </Link>
             <a href="#features" className="hover:text-slate-900 transition-colors">Features</a>
             <a href="#calculator" className="hover:text-slate-900 transition-colors">Rate Calculator</a>
             <a href="#marketplace" className="hover:text-slate-900 transition-colors">Brand Marketplace</a>
@@ -116,6 +120,9 @@ export default function LandingPage() {
 
           {/* Trust Badges */}
           <div className="mt-12 flex flex-wrap items-center justify-center gap-6 text-xs text-slate-500 font-medium">
+            <span className="flex items-center gap-1.5">
+              <Film className="h-4 w-4 text-violet-600" /> 8-Dimension Video & Audio AI Auditing
+            </span>
             <span className="flex items-center gap-1.5">
               <ShieldCheck className="h-4 w-4 text-emerald-600" /> Official Meta Graph API Ready
             </span>
@@ -302,6 +309,33 @@ export default function LandingPage() {
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+          {/* Feature: Reel Intelligence */}
+          <Card className="hover:border-violet-300 ring-1 ring-violet-500/20 bg-gradient-to-b from-violet-50/40 to-transparent">
+            <CardHeader>
+              <div className="h-10 w-10 rounded-xl bg-violet-600 flex items-center justify-center text-white mb-3 shadow-md shadow-violet-500/30">
+                <Film className="h-5 w-5" />
+              </div>
+              <div className="flex items-center justify-between">
+                <CardTitle>Woka Reel Intelligence</CardTitle>
+                <Badge variant="verified" className="text-[10px]">NEW</Badge>
+              </div>
+              <CardDescription>
+                AI video intelligence engine that scores Reels across 8 dimensions, diagnoses pacing drop-offs, and audits Instagram UI safe zones.
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="text-xs text-slate-600 space-y-2">
+              <div className="flex items-center gap-2">
+                <CheckCircle2 className="h-4 w-4 text-emerald-500" /> Public URL, MP4 Upload & Meta API modes
+              </div>
+              <div className="flex items-center gap-2">
+                <CheckCircle2 className="h-4 w-4 text-emerald-500" /> Timestamped scene cuts & speech WPM audit
+              </div>
+              <div className="flex items-center gap-2">
+                <CheckCircle2 className="h-4 w-4 text-emerald-500" /> Multi-Reel side-by-side benchmark comparison
+              </div>
+            </CardContent>
+          </Card>
+
           {/* Feature 1 */}
           <Card className="hover:border-violet-300">
             <CardHeader>

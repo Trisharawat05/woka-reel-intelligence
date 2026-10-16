@@ -70,8 +70,14 @@ class ScoreDetail(BaseModel):
 
 class ScoreOverview(BaseModel):
     creative_quality: ScoreDetail
+    hook_strength: Optional[ScoreDetail] = None
+    editing_and_pacing: Optional[ScoreDetail] = None
+    content_clarity: Optional[ScoreDetail] = None
+    cta_effectiveness: Optional[ScoreDetail] = None
     performance: ScoreDetail
+    performance_insights: Optional[ScoreDetail] = None
     growth_conversion: ScoreDetail
+    growth_and_conversion: Optional[ScoreDetail] = None
     viral_potential: ScoreDetail
 
 

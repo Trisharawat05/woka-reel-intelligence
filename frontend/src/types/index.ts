@@ -245,8 +245,14 @@ export interface ScoreDetail {
 
 export interface ScoreOverview {
   creative_quality: ScoreDetail;
+  hook_strength?: ScoreDetail;
+  editing_and_pacing?: ScoreDetail;
+  content_clarity?: ScoreDetail;
+  cta_effectiveness?: ScoreDetail;
   performance: ScoreDetail;
+  performance_insights?: ScoreDetail;
   growth_conversion: ScoreDetail;
+  growth_and_conversion?: ScoreDetail;
   viral_potential: ScoreDetail;
 }
 

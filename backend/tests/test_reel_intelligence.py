@@ -304,6 +304,21 @@ def test_upload_magic_bytes_inspection(client, auth_headers):
     )
     assert res_valid.status_code == 202
     assert res_valid.json()["analysis_mode"] == "VIDEO_UPLOAD"
+    upload_job_id = res_valid.json()["id"]
+
+    # Poll status -> TestClient executes BackgroundTasks before return, so status is COMPLETED
+    poll = client.get(f"/api/v1/reel-intelligence/jobs/{upload_job_id}", headers=auth_headers)
+    assert poll.status_code == 200
+    assert poll.json()["status"] == "COMPLETED"
+    upload_report_id = poll.json()["report_id"]
+    assert upload_report_id is not None
+
+    # Fetch persisted report
+    rep = client.get(f"/api/v1/reel-intelligence/reports/{upload_report_id}", headers=auth_headers)
+    assert rep.status_code == 200
+    assert rep.json()["analysis_mode"] == "VIDEO_UPLOAD"
+    assert "scores" in rep.json()
+
 
 
 def test_idempotent_job_submission(client, auth_headers):

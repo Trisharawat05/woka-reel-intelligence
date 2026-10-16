@@ -1,7 +1,8 @@
 import {
   User, Workspace, InstagramAccount, Automation, AutomationLog,
   AnalyticsResponse, CreatorProfile, BrandCampaign, CampaignApplication,
-  Invoice, Subscription, NotificationItem
+  Invoice, Subscription, NotificationItem,
+  ReelAnalysisJob, ReelReport, ReelReportSummary, ReelComparison
 } from "@/types";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api/v1";
@@ -34,6 +35,10 @@ class ApiClient {
       "Content-Type": "application/json",
       ...(options.headers as Record<string, string>),
     };
+
+    if (options.body instanceof FormData) {
+      delete headers["Content-Type"];
+    }
 
     if (token) {
       headers["Authorization"] = `Bearer ${token}`;
@@ -285,6 +290,92 @@ class ApiClient {
   async listAdminUsers(): Promise<User[]> {
     return this.request("/admin/users");
   }
+
+  // Reel Intelligence
+  async submitPublicReelUrl(data: {
+    url: string;
+    declared_views?: number;
+    declared_likes?: number;
+    declared_comments?: number;
+    declared_shares?: number;
+    declared_saves?: number;
+  }): Promise<ReelAnalysisJob> {
+    return this.request("/reel-intelligence/jobs/url", {
+      method: "POST",
+      body: JSON.stringify(data),
+    });
+  }
+
+  async submitVideoUpload(file: File): Promise<ReelAnalysisJob> {
+    const formData = new FormData();
+    formData.append("file", file);
+    return this.request("/reel-intelligence/jobs/upload", {
+      method: "POST",
+      body: formData,
+    });
+  }
+
+  async submitConnectedReel(data: {
+    media_id: string;
+    title?: string;
+    caption?: string;
+    media_url?: string;
+    thumbnail_url?: string;
+  }): Promise<ReelAnalysisJob> {
+    return this.request("/reel-intelligence/jobs/connected", {
+      method: "POST",
+      body: JSON.stringify(data),
+    });
+  }
+
+  async getReelJob(jobId: string): Promise<ReelAnalysisJob> {
+    return this.request(`/reel-intelligence/jobs/${jobId}`);
+  }
+
+  async getReelReport(reportId: string): Promise<ReelReport> {
+    return this.request(`/reel-intelligence/reports/${reportId}`);
+  }
+
+  async listReelReports(params?: { search?: string; mode?: string }): Promise<ReelReportSummary[]> {
+    const query = new URLSearchParams();
+    if (params?.search) query.set("search", params.search);
+    if (params?.mode) query.set("mode", params.mode);
+    const queryString = query.toString() ? `?${query.toString()}` : "";
+    return this.request(`/reel-intelligence/reports${queryString}`);
+  }
+
+  async compareReels(reportIds: string[]): Promise<ReelComparison> {
+    return this.request("/reel-intelligence/compare", {
+      method: "POST",
+      body: JSON.stringify({ report_ids: reportIds }),
+    });
+  }
+
+  async retryReelJob(jobId: string): Promise<ReelAnalysisJob> {
+    return this.request(`/reel-intelligence/jobs/${jobId}/retry`, {
+      method: "POST",
+    });
+  }
+
+  async getConnectedReels(): Promise<{
+    has_connected_account: boolean;
+    username?: string;
+    is_sandbox?: boolean;
+    reels: Array<{
+      media_id: string;
+      title: string;
+      caption: string;
+      thumbnail_url: string;
+      media_url: string;
+      views: number;
+      likes: number;
+      comments: number;
+      published_at: string;
+    }>;
+  }> {
+    return this.request("/reel-intelligence/connected-reels");
+  }
 }
+
 
 export const api = new ApiClient();

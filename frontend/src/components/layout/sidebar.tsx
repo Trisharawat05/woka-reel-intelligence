@@ -15,8 +15,10 @@ import {
   CreditCard,
   ShieldAlert,
   Zap,
-  ExternalLink
+  ExternalLink,
+  Film
 } from "lucide-react";
+
 import { cn } from "@/lib/utils";
 import { useAuth } from "@/lib/auth-context";
 import { Badge } from "@/components/ui/badge";
@@ -24,6 +26,7 @@ import { Badge } from "@/components/ui/badge";
 const navigationItems = [
   { name: "Overview", href: "/dashboard", icon: LayoutDashboard },
   { name: "Instagram Sync", href: "/dashboard/instagram", icon: Instagram },
+  { name: "Reel Intelligence", href: "/dashboard/reel-intelligence", icon: Film, badge: "AI" },
   { name: "Automations", href: "/dashboard/automations", icon: Bot, badge: "Core" },
   { name: "Analytics & Reach", href: "/dashboard/analytics", icon: BarChart3 },
   { name: "AI Content Studio", href: "/dashboard/ai-studio", icon: Sparkles },

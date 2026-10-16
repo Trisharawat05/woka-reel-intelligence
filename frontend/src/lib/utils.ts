@@ -23,3 +23,8 @@ export function formatCurrency(amount: number, currency: string = "USD"): string
     maximumFractionDigits: 2,
   }).format(amount);
 }
+
+export function formatPercent(decimal: number, digits: number = 1): string {
+  return (decimal * 100).toFixed(digits) + "%";
+}
+

@@ -249,3 +249,99 @@ Real-time alerts and activity stream.
 | `link` | VARCHAR(255) | NULLABLE | Actionable target URL |
 | `is_read` | BOOLEAN | NOT NULL, DEFAULT FALSE | Read indicator |
 | `created_at` | TIMESTAMP WITH TIME ZONE | NOT NULL, DEFAULT NOW() | Timestamp |
+
+---
+
+### 1.13 `reel_media_assets`
+Ingested and processed media assets (video uploads, public reels, thumbnail frames) associated with a workspace.
+| Column | Type | Constraints | Description |
+|---|---|---|---|
+| `id` | VARCHAR(36) | PRIMARY KEY | Asset UUID |
+| `workspace_id` | VARCHAR(36) | FOREIGN KEY -> `workspaces.id`, INDEX | Parent workspace |
+| `source_type` | VARCHAR(30) | NOT NULL | `PUBLIC_URL`, `VIDEO_UPLOAD`, `CONNECTED_ACCOUNT` |
+| `original_url` | TEXT | NULLABLE | Original external URL (if applicable) |
+| `storage_path` | VARCHAR(500) | NULLABLE | Local or S3 path to video file |
+| `thumbnail_path` | VARCHAR(500) | NULLABLE | Extracted or downloaded thumbnail image path |
+| `file_size_bytes` | BIGINT | NULLABLE | Video file size |
+| `mime_type` | VARCHAR(100) | NULLABLE | e.g. `video/mp4`, `video/quicktime` |
+| `duration_seconds` | FLOAT | NULLABLE | Detected video duration |
+| `width` | INTEGER | NULLABLE | Pixel width |
+| `height` | INTEGER | NULLABLE | Pixel height |
+| `created_at` | TIMESTAMP WITH TIME ZONE | NOT NULL, DEFAULT NOW() | Ingestion timestamp |
+
+---
+
+### 1.14 `reel_analysis_jobs`
+Asynchronous processing jobs tracking the multi-stage analysis pipeline.
+| Column | Type | Constraints | Description |
+|---|---|---|---|
+| `id` | VARCHAR(36) | PRIMARY KEY | Job UUID |
+| `workspace_id` | VARCHAR(36) | FOREIGN KEY -> `workspaces.id`, INDEX | Parent workspace |
+| `asset_id` | VARCHAR(36) | FOREIGN KEY -> `reel_media_assets.id` | Target media asset |
+| `mode` | VARCHAR(30) | NOT NULL | `PUBLIC_URL`, `VIDEO_UPLOAD`, `CONNECTED_ACCOUNT` |
+| `instagram_media_id` | VARCHAR(100) | NULLABLE | Connected Meta Media ID |
+| `status` | VARCHAR(30) | NOT NULL | `QUEUED`, `INGESTING`, `PROCESSING_VIDEO`, `ANALYZING_METRICS`, `GENERATING_AI_REPORT`, `COMPLETED`, `FAILED` |
+| `progress_percent` | INTEGER | NOT NULL, DEFAULT 0 | 0 to 100 completion percentage |
+| `status_message` | VARCHAR(255) | NULLABLE | Active stage descriptor |
+| `error_details` | TEXT | NULLABLE | Error message and traceback on failure |
+| `retry_count` | INTEGER | NOT NULL, DEFAULT 0 | Job retry attempts |
+| `created_at` | TIMESTAMP WITH TIME ZONE | NOT NULL, DEFAULT NOW() | Queued timestamp |
+| `completed_at` | TIMESTAMP WITH TIME ZONE | NULLABLE | Finished timestamp |
+
+---
+
+### 1.15 `reel_metric_snapshots`
+Time-series metric captures for growth velocity and historical baseline comparisons.
+| Column | Type | Constraints | Description |
+|---|---|---|---|
+| `id` | VARCHAR(36) | PRIMARY KEY | Snapshot UUID |
+| `workspace_id` | VARCHAR(36) | FOREIGN KEY -> `workspaces.id`, INDEX | Parent workspace |
+| `instagram_media_id` | VARCHAR(100) | NULLABLE, INDEX | Meta media object ID |
+| `views_count` | INTEGER | NOT NULL, DEFAULT 0 | View / play count |
+| `reach_count` | INTEGER | NULLABLE | Unique viewer reach (authorized mode only) |
+| `likes_count` | INTEGER | NOT NULL, DEFAULT 0 | Like count |
+| `comments_count` | INTEGER | NOT NULL, DEFAULT 0 | Comment count |
+| `shares_count` | INTEGER | NULLABLE | Share count |
+| `saves_count` | INTEGER | NULLABLE | Save/bookmark count |
+| `total_watch_time_seconds`| FLOAT | NULLABLE | Aggregated watch time |
+| `average_watch_time_seconds`| FLOAT | NULLABLE | Mean retention watch time |
+| `follows_attributed` | INTEGER | NULLABLE | Follows gained directly from Reel |
+| `profile_visits_attributed` | INTEGER | NULLABLE | Profile visits from Reel |
+| `captured_at` | TIMESTAMP WITH TIME ZONE | NOT NULL, DEFAULT NOW() | Snapshot timestamp |
+
+---
+
+### 1.16 `reel_reports`
+Comprehensive, production-grade intelligence reports combining video findings, scorecards, and action plans.
+| Column | Type | Constraints | Description |
+|---|---|---|---|
+| `id` | VARCHAR(36) | PRIMARY KEY | Report UUID |
+| `workspace_id` | VARCHAR(36) | FOREIGN KEY -> `workspaces.id`, INDEX | Parent workspace |
+| `job_id` | VARCHAR(36) | FOREIGN KEY -> `reel_analysis_jobs.id`, UNIQUE | Originating analysis job |
+| `asset_id` | VARCHAR(36) | FOREIGN KEY -> `reel_media_assets.id` | Target media asset |
+| `title` | VARCHAR(255) | NOT NULL | Video title or caption headline |
+| `caption` | TEXT | NULLABLE | Extracted or submitted caption |
+| `analysis_mode` | VARCHAR(30) | NOT NULL | `PUBLIC_URL`, `VIDEO_UPLOAD`, `CONNECTED_ACCOUNT` |
+| `scores_json` | JSON / TEXT | NOT NULL | 4 distinct scores (Creative, Performance, Growth, Viral) |
+| `calculated_metrics_json` | JSON / TEXT | NOT NULL | Documented rates with numerator/denominator |
+| `video_intelligence_json` | JSON / TEXT | NOT NULL | Scene cuts, lighting, WPM, safe-zone hazards |
+| `timeline_findings_json` | JSON / TEXT | NOT NULL | Timestamped observations and proposed edits |
+| `prioritized_action_plan_json` | JSON / TEXT | NOT NULL | 3-tier prioritized what/why/how action items |
+| `creative_alternatives_json` | JSON / TEXT | NOT NULL | 4 Hook frameworks, thumbnails, CTAs, revised scripts |
+| `provenance_json` | JSON / TEXT | NOT NULL | Pipeline version, models, data limitations |
+| `created_at` | TIMESTAMP WITH TIME ZONE | NOT NULL, DEFAULT NOW() | Generation timestamp |
+| `updated_at` | TIMESTAMP WITH TIME ZONE | NOT NULL, DEFAULT NOW() | Last update timestamp |
+
+---
+
+### 1.17 `reel_comparisons`
+Multi-Reel comparative analysis reports (2 to 5 Reels).
+| Column | Type | Constraints | Description |
+|---|---|---|---|
+| `id` | VARCHAR(36) | PRIMARY KEY | Comparison UUID |
+| `workspace_id` | VARCHAR(36) | FOREIGN KEY -> `workspaces.id`, INDEX | Parent workspace |
+| `report_ids_json` | JSON / TEXT | NOT NULL | Array of compared Report UUIDs |
+| `comparison_matrix_json` | JSON / TEXT | NOT NULL | Side-by-side metric comparison |
+| `comparative_takeaways_json`| JSON / TEXT | NOT NULL | Actionable differential takeaways |
+| `winner_id` | VARCHAR(36) | NULLABLE | Top-performing report ID |
+| `created_at` | TIMESTAMP WITH TIME ZONE | NOT NULL, DEFAULT NOW() | Creation timestamp |

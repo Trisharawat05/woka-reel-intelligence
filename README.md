@@ -6,18 +6,19 @@
 
 ## 🌟 Key Features
 
-1. **Authentication & Multi-Tenancy:** Secure JWT access & refresh tokens, password hashing with bcrypt, role-based access control (`CREATOR`, `BRAND`, `AGENCY`, `ADMIN`), and workspace scoping.
-2. **Official Meta Instagram Integration:** Server-side OAuth 2.0 authorization code flow, 60-day Long-Lived Token exchange, AES-256 token encryption at rest, and HMAC-SHA256 signature verification on webhooks.
-3. **Interactive Demo Sandbox:** 1-click test mode that generates realistic mock creator accounts, allows simulating comment triggers, and renders live DM previews without waiting for Meta App Review approval.
-4. **Instagram Comment-to-DM Automation:** Keyword matching rules (Exact, Contains Any, Any Comment), personalized variables (`{{username}}`), public comment replies, and anti-spam cooldown intervals.
-5. **Interactive Trigger Simulator:** In-app sandbox phone mockup simulator to test comment responses and verify execution logs in real-time.
-6. **Creator Analytics & Reach:** 30-day time-series growth curves with Recharts, audience age/gender demographic breakdowns, and top-performing Reels sorted by engagement rate.
-7. **AI Content Studio:** Generative captions with custom tone controls, 5 viral Reels hook frameworks (Curiosity Gap, Contrarian, Blueprint), and smart reach-tiered hashtag buckets.
-8. **Public Creator Media Kit:** Public vanity link (`/kit/[slug]`) featuring verified Meta follower stats, audience reach, deliverable rate cards, and an interactive "Work with Me" brand inquiry form.
-9. **Brand Collaboration Marketplace:** Discover active campaigns, filter by niche and budget, submit creative pitches and deliverable milestones (`REEL`, `STORY`, `BUNDLE`).
-10. **Invoicing & Smart Rate Calculator:** Defensible CPM-based pricing calculator and itemized invoice generator with 1-click payment status tracking (`DRAFT`, `SENT`, `PAID`).
-11. **Subscription & Quota Management:** Real-time usage meters for comment automations and AI generations across `FREE`, `PRO`, and `AGENCY` tiers.
-12. **Admin Operations & Telemetry:** Platform overview of registered users, active automations, webhook throughput, and infrastructure latency.
+1. **Woka Reel Intelligence:** AI-powered Instagram Reel analysis and optimization platform. Features dual modes (Public URL/Video Upload & Connected Meta Account), computer vision scene cut analysis, speech cadence/WPM tracking, dead-air detection, 4 explainable scores (Creative Quality, Performance, Growth Conversion, Viral Potential), timestamped findings timeline, 3-tier prioritized action plans, and multi-Reel comparison.
+2. **Authentication & Multi-Tenancy:** Secure JWT access & refresh tokens, password hashing with bcrypt, role-based access control (`CREATOR`, `BRAND`, `AGENCY`, `ADMIN`), and workspace scoping.
+3. **Official Meta Instagram Integration:** Server-side OAuth 2.0 authorization code flow, 60-day Long-Lived Token exchange, AES-256 token encryption at rest, and HMAC-SHA256 signature verification on webhooks.
+4. **Interactive Demo Sandbox:** 1-click test mode that generates realistic mock creator accounts, allows simulating comment triggers, and renders live DM previews without waiting for Meta App Review approval.
+5. **Instagram Comment-to-DM Automation:** Keyword matching rules (Exact, Contains Any, Any Comment), personalized variables (`{{username}}`), public comment replies, and anti-spam cooldown intervals.
+6. **Interactive Trigger Simulator:** In-app sandbox phone mockup simulator to test comment responses and verify execution logs in real-time.
+7. **Creator Analytics & Reach:** 30-day time-series growth curves with Recharts, audience age/gender demographic breakdowns, and top-performing Reels sorted by engagement rate.
+8. **AI Content Studio:** Generative captions with custom tone controls, 5 viral Reels hook frameworks (Curiosity Gap, Contrarian, Blueprint), and smart reach-tiered hashtag buckets.
+9. **Public Creator Media Kit:** Public vanity link (`/kit/[slug]`) featuring verified Meta follower stats, audience reach, deliverable rate cards, and an interactive "Work with Me" brand inquiry form.
+10. **Brand Collaboration Marketplace:** Discover active campaigns, filter by niche and budget, submit creative pitches and deliverable milestones (`REEL`, `STORY`, `BUNDLE`).
+11. **Invoicing & Smart Rate Calculator:** Defensible CPM-based pricing calculator and itemized invoice generator with 1-click payment status tracking (`DRAFT`, `SENT`, `PAID`).
+12. **Subscription & Quota Management:** Real-time usage meters for comment automations and AI generations across `FREE`, `PRO`, and `AGENCY` tiers.
+13. **Admin Operations & Telemetry:** Platform overview of registered users, active automations, webhook throughput, and infrastructure latency.
 
 ---
 
@@ -58,6 +59,7 @@ npm install
 npm run dev
 ```
 - Web Application: `http://localhost:3000`
+- Reel Intelligence: `http://localhost:3000/dashboard/reel-intelligence`
 
 ---
 
@@ -82,28 +84,33 @@ Public Demo Media Kit Link: `http://localhost:3000/kit/alexrivera`
 cd backend
 .\venv\Scripts\python -m pytest -v
 ```
-All 16 test cases cover:
-- User registration, login, and JWT claims
+All 50 test cases cover:
+- Woka Reel Intelligence metric formulas, edge cases (0 views/missing reach), audio speech WPM, AI diagnosis scoring ranges, job submission, comparison engine, and tenant isolation
+- User registration, login, JWT claims, and token revocation
 - Tenant isolation and permission checks
 - Comment-to-DM trigger matching and simulator engine
 - Meta Webhook handshake (`hub.challenge`) and HMAC signature validation
 - AES-256 token encryption and decryption roundtrip
 - Rate pricing calculator formulas and invoice calculations
+- Meta reviewer privilege enforcement and data deletion compliance
 
-### Frontend Build & Typecheck
+### Frontend Test Suite & Production Build
 ```bash
 cd frontend
+npm test
 npm run build
 ```
+All 11 unit/integration tests cover formatting, regex shortcode validators, and score tier thresholds. Next.js App Router static build verification passes cleanly.
 
 ---
 
 ## 📂 Project Architecture Documentation
 
 All specifications, architectural designs, and decision records are maintained in the repository root:
-- `PRD.md`: Complete Product Requirements Document across all 12 modules
+- `REEL_INTELLIGENCE.md`: Complete architecture and specification for Woka Reel Intelligence
+- `PRD.md`: Complete Product Requirements Document across all modules
 - `architecture.md`: Modular monolith system diagram, Meta OAuth flow, and multi-tenancy
-- `database-schema.md`: Complete data dictionary and entity-relationship models
+- `database-schema.md`: Complete data dictionary including Reel Intelligence models
 - `design-system.md`: Design tokens, Violet-to-Coral palette, typography, and card specifications
 - `security.md`: Meta compliance, AES-256 encryption, HMAC signatures, and RBAC
 - `testing.md`: Quality assurance and automated testing strategy

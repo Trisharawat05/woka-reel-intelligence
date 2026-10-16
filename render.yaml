@@ -1,0 +1,85 @@
+# ==============================================================================
+# Woka Reel Intelligence — Render Staging Infrastructure Blueprint
+# ==============================================================================
+# Deploys:
+#   1. Managed PostgreSQL 16 database (woka-postgres-staging)
+#   2. Managed Redis 7 cache / queue (woka-redis-staging)
+#   3. FastAPI Backend Web Service (woka-api-staging) with pre-traffic Alembic migration
+#
+# Usage:
+#   Connect this repository to Render and create a new Blueprint Instance.
+#   Configure sensitive secrets (TOKEN_ENCRYPTION_KEY, META_APP_*) in the Render Dashboard.
+
+services:
+  # ----------------------------------------------------------------------------
+  # FastAPI Backend API Service
+  # ----------------------------------------------------------------------------
+  - type: web
+    name: woka-api-staging
+    runtime: python
+    rootDir: backend
+    plan: starter
+    region: oregon
+    buildCommand: "pip install --upgrade pip && pip install -r requirements.txt"
+    startCommand: "python -m alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port $PORT"
+    healthCheckPath: /healthz
+    envVars:
+      - key: ENVIRONMENT
+        value: staging
+      - key: DEBUG
+        value: "false"
+      - key: PROJECT_NAME
+        value: "Woka Reel Intelligence API (Staging)"
+      - key: VERSION
+        value: "1.0.0"
+      - key: API_V1_STR
+        value: /api/v1
+      - key: DATABASE_URL
+        fromDatabase:
+          name: woka-postgres-staging
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: woka-redis-staging
+          property: connectionString
+      - key: SECRET_KEY
+        generateValue: true
+      - key: TOKEN_ENCRYPTION_KEY
+        sync: false # Provide Fernet 32-byte URL-safe base64 key in Render Dashboard
+      - key: FRONTEND_URL
+        sync: false # e.g. https://woka-staging.vercel.app
+      - key: CORS_ORIGINS
+        sync: false # e.g. ["https://woka-staging.vercel.app"]
+      - key: ALLOWED_HOSTS
+        value: "*"
+      - key: META_APP_ID
+        sync: false # Configured in Render Dashboard from Meta Developers Portal
+      - key: META_APP_SECRET
+        sync: false # Configured in Render Dashboard from Meta Developers Portal
+      - key: META_VERIFY_TOKEN
+        generateValue: true
+      - key: META_REDIRECT_URI
+        sync: false # e.g. https://woka-staging.vercel.app/dashboard/instagram/callback
+      - key: META_API_VERSION
+        value: v21.0
+
+  # ----------------------------------------------------------------------------
+  # Managed Redis Cache & Queue
+  # ----------------------------------------------------------------------------
+  - type: redis
+    name: woka-redis-staging
+    plan: starter
+    region: oregon
+    ipAllowList: [] # Private network internal access only
+
+databases:
+  # ----------------------------------------------------------------------------
+  # Managed PostgreSQL 16 Database
+  # ----------------------------------------------------------------------------
+  - name: woka-postgres-staging
+    databaseName: woka_staging
+    user: woka_user
+    plan: starter
+    region: oregon
+    postgresMajorVersion: "16"

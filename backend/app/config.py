@@ -1,7 +1,7 @@
 import os
-from typing import List
+from typing import List, Any
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import Field, model_validator
+from pydantic import Field, model_validator, field_validator
 
 class Settings(BaseSettings):
     PROJECT_NAME: str = "Woka API"
@@ -17,7 +17,6 @@ class Settings(BaseSettings):
     REFRESH_TOKEN_EXPIRE_DAYS: int = 30
     
     # Fernet AES-256 Symmetric key for token encryption at rest (url-safe base64 32-bytes)
-    # Default development key provided for zero-friction local run; override via environment variable in production
     TOKEN_ENCRYPTION_KEY: str = Field(
         default="eF9rVlBfZkRzQ3ZfU0VDUkVUX0tFWV8xMjM0NTY3ODk=",
         description="Fernet 32-byte urlsafe key for encrypting Meta OAuth tokens at rest"
@@ -25,6 +24,12 @@ class Settings(BaseSettings):
 
     # Database
     DATABASE_URL: str = Field(default="sqlite:///./woka.db", description="SQLAlchemy database URL")
+
+    # Redis (Cache, Sliding-Window Rate Limiting, Background Workers)
+    REDIS_URL: str = Field(
+        default="",
+        description="Redis connection URL for shared caching and background processing"
+    )
 
     # Official Meta / Instagram App Credentials
     META_APP_ID: str = Field(default="mock_meta_app_id_12345", description="Meta Developer App ID")
@@ -34,13 +39,17 @@ class Settings(BaseSettings):
     META_API_VERSION: str = Field(default="v21.0", description="Meta Graph API version (e.g. v21.0)")
     FRONTEND_URL: str = Field(default="http://localhost:3000", description="Frontend application URL")
 
-    # CORS
+    # CORS & Trusted Hosts
     CORS_ORIGINS: List[str] = [
         "http://localhost:3000",
         "http://127.0.0.1:3000",
         "http://localhost:8000",
         "http://127.0.0.1:8000"
     ]
+    ALLOWED_HOSTS: List[str] = Field(
+        default=["*"],
+        description="Allowed host headers for TrustedHostMiddleware"
+    )
 
     # Optional AI Provider (if empty, Woka's intelligent local template & NLP heuristic engine is used)
     OPENAI_API_KEY: str = Field(default="", description="Optional OpenAI API Key")
@@ -51,8 +60,50 @@ class Settings(BaseSettings):
         extra="ignore"
     )
 
+    @field_validator("DATABASE_URL", mode="before")
+    @classmethod
+    def assemble_db_connection(cls, v: Any) -> Any:
+        if isinstance(v, str):
+            v_str = v.strip()
+            # Normalize postgres:// to postgresql:// for SQLAlchemy compatibility on Render/Fly/Neon
+            if v_str.startswith("postgres://"):
+                return v_str.replace("postgres://", "postgresql://", 1)
+        return v
+
+    @field_validator("CORS_ORIGINS", mode="before")
+    @classmethod
+    def parse_cors_origins(cls, v: Any) -> Any:
+        if isinstance(v, str):
+            v_str = v.strip()
+            if v_str.startswith("[") and v_str.endswith("]"):
+                import json
+                try:
+                    return json.loads(v_str)
+                except Exception:
+                    pass
+            return [origin.strip() for origin in v_str.split(",") if origin.strip()]
+        return v
+
+    @field_validator("ALLOWED_HOSTS", mode="before")
+    @classmethod
+    def parse_allowed_hosts(cls, v: Any) -> Any:
+        if isinstance(v, str):
+            v_str = v.strip()
+            if v_str.startswith("[") and v_str.endswith("]"):
+                import json
+                try:
+                    return json.loads(v_str)
+                except Exception:
+                    pass
+            return [host.strip() for host in v_str.split(",") if host.strip()]
+        return v
+
     @model_validator(mode="after")
     def validate_production_security(self):
+        # Auto-include FRONTEND_URL in CORS_ORIGINS to prevent cross-origin mismatches
+        if self.FRONTEND_URL and self.FRONTEND_URL not in self.CORS_ORIGINS:
+            self.CORS_ORIGINS.append(self.FRONTEND_URL)
+
         if self.ENVIRONMENT.lower() == "production":
             default_secret = "woka-super-secret-production-grade-signing-key-32chars-min!"
             default_fernet = "eF9rVlBfZkRzQ3ZfU0VDUkVUX0tFWV8xMjM0NTY3ODk="

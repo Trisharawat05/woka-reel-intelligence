@@ -1,4 +1,6 @@
+import urllib.parse
 from fastapi import APIRouter, Depends, Request, Response, HTTPException, status, Query
+from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 from typing import Optional
 
@@ -22,6 +24,7 @@ from app.services.instagram_service import (
     toggle_sandbox_account,
     verify_meta_webhook_signature,
     verify_oauth_state,
+    extract_payload_from_signed_state,
     process_incoming_webhook_event,
     parse_meta_signed_request,
     connect_or_update_account_from_oauth,
@@ -31,7 +34,7 @@ from app.services.instagram_service import (
     refresh_workspace_instagram_token
 )
 from app.models.instagram import InstagramAccount
-from app.security import get_current_user
+from app.security import get_current_user, rate_limit
 
 router = APIRouter(prefix="/instagram", tags=["Instagram Integration"])
 
@@ -51,10 +54,56 @@ def get_account(current_user: User = Depends(get_current_user), db: Session = De
     return InstagramAccountResponse.model_validate(account)
 
 @router.get("/oauth-url", response_model=InstagramOAuthURLResponse)
-def get_oauth_url(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def get_oauth_url(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    _limiter: bool = Depends(rate_limit(max_requests=15, window_seconds=60))
+):
     workspace = get_or_create_workspace(db, current_user)
     data = get_oauth_authorization_url(workspace.id)
     return InstagramOAuthURLResponse(**data)
+
+@router.get("/callback")
+def oauth_get_callback(
+    code: Optional[str] = Query(None),
+    state: Optional[str] = Query(None),
+    error: Optional[str] = Query(None),
+    error_reason: Optional[str] = Query(None),
+    error_description: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+    _limiter: bool = Depends(rate_limit(max_requests=10, window_seconds=60))
+):
+    """
+    Standard browser redirect callback from Meta OAuth authorization dialog.
+    Extracts workspace_id exclusively from the cryptographic HMAC-signed state.
+    Redirects user browser to frontend dashboard with status parameters.
+    """
+    if error:
+        err_msg = error_description or error_reason or error
+        redirect_url = f"{settings.FRONTEND_URL}/dashboard/instagram?error={urllib.parse.quote(err_msg)}"
+        return RedirectResponse(url=redirect_url, status_code=status.HTTP_302_FOUND)
+
+    if not code or not state:
+        redirect_url = f"{settings.FRONTEND_URL}/dashboard/instagram?error={urllib.parse.quote('Missing required code or state parameter from Meta redirect.')}"
+        return RedirectResponse(url=redirect_url, status_code=status.HTTP_302_FOUND)
+
+    payload = extract_payload_from_signed_state(state)
+    if not payload or not payload.get("workspace_id"):
+        redirect_url = f"{settings.FRONTEND_URL}/dashboard/instagram?error={urllib.parse.quote('Invalid or tampered OAuth state parameter (CSRF protection failed).')}"
+        return RedirectResponse(url=redirect_url, status_code=status.HTTP_302_FOUND)
+
+    workspace_id = payload["workspace_id"]
+
+    try:
+        account = connect_or_update_account_from_oauth(db, workspace_id, code, state)
+        redirect_url = f"{settings.FRONTEND_URL}/dashboard/instagram?connected=true&username={urllib.parse.quote(account.username)}"
+        return RedirectResponse(url=redirect_url, status_code=status.HTTP_302_FOUND)
+    except HTTPException as exc:
+        redirect_url = f"{settings.FRONTEND_URL}/dashboard/instagram?error={urllib.parse.quote(str(exc.detail))}"
+        return RedirectResponse(url=redirect_url, status_code=status.HTTP_302_FOUND)
+    except Exception as exc:
+        redirect_url = f"{settings.FRONTEND_URL}/dashboard/instagram?error={urllib.parse.quote(str(exc))}"
+        return RedirectResponse(url=redirect_url, status_code=status.HTTP_302_FOUND)
 
 @router.post("/connect", response_model=InstagramAccountResponse)
 def connect_account(payload: InstagramConnectRequest, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
@@ -71,7 +120,11 @@ def oauth_callback(payload: InstagramConnectRequest, current_user: User = Depend
     return InstagramAccountResponse.model_validate(account)
 
 @router.post("/sync-insights", response_model=InstagramSyncInsightsResponse)
-def sync_insights(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def sync_insights(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    _limiter: bool = Depends(rate_limit(max_requests=10, window_seconds=60))
+):
     """Synchronizes live Reel insights from Meta Graph API without data fabrication."""
     workspace = get_or_create_workspace(db, current_user)
     result = sync_connected_account_insights(db, workspace.id)

@@ -34,6 +34,8 @@ def db_session():
 
 @pytest.fixture(scope="function")
 def client(db_session):
+    from app.security import reset_rate_limits
+    reset_rate_limits()
     def override_get_db():
         try:
             yield db_session
@@ -44,6 +46,7 @@ def client(db_session):
     with TestClient(app) as test_client:
         yield test_client
     app.dependency_overrides.clear()
+    reset_rate_limits()
 
 @pytest.fixture
 def test_creator_user(db_session):

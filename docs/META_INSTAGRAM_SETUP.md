@@ -2,14 +2,17 @@
 
 ## 1. Overview & Architecture
 
-Woka Reel Intelligence integrates with the official **Meta Graph API (v21.0)** using **Instagram Login for Business**. This integration grants Woka access to verified professional account metrics and media insights for published Instagram Reels without credential sharing.
+Woka Reel Intelligence integrates with the official **Meta Graph API (v21.0 & v22.0)** using **Instagram Login for Business**. This integration grants Woka access to verified professional account metrics and media insights for published Instagram Reels without credential sharing.
 
 ### Key Capabilities
 - **OAuth 2.0 Authorization-Code Flow**: Secure user connection via Meta's official login dialog.
-- **CSRF & Replay Mitigation**: HMAC-SHA256 signed state parameters with 15-minute expiration windows and single-use cryptographic nonces.
+- **Dual Callback Architecture**: Supports both direct browser redirect (`GET /api/v1/instagram/callback`) with automatic 302 frontend routing, and client-side code exchange (`POST /api/v1/instagram/connect` / `/callback`).
+- **CSRF & Replay Mitigation**: HMAC-SHA256 signed state parameters with 15-minute expiration windows and single-use cryptographic nonces. The `workspace_id` is extracted exclusively from the validated cryptographic state signature.
 - **Encryption at Rest**: Access tokens are symmetrically encrypted at rest using AES-256 (Fernet) via `TOKEN_ENCRYPTION_KEY`.
-- **60-Day Token Lifecycle**: Automatic exchange from short-lived tokens to 60-day long-lived tokens with refresh support before expiration.
-- **Zero Fabrication Live Metrics**: When in live connected mode, real metrics (`reach`, `saved`, `shares`, `total_interactions`) are retrieved directly from `graph.instagram.com`. API errors fail gracefully with provenance tracking and never fabricate synthetic numbers.
+- **60-Day Token Lifecycle**: Automatic exchange from short-lived tokens to 60-day long-lived tokens with refresh support before expiration (`POST /api/v1/instagram/refresh-token`).
+- **Unified Views Metric & Error Code 100 Fallback**: Queries `views,reach,saved,shares,total_interactions` across Reels, automatically falling back to `reach,saved,shares,total_interactions` if Meta returns error code 100 on legacy media objects.
+- **Bounded Exponential Backoff**: Automatic retry mechanism (max 3 retries, exponential backoff) for transient 5xx server errors and network blips.
+- **Zero Fabrication Live Metrics**: When in live connected mode, real metrics are retrieved directly from `graph.instagram.com`. API errors fail gracefully with provenance tracking and never fabricate synthetic numbers.
 - **Strict Tenant Isolation**: Workspace ownership is verified on all read, sync, refresh, and disconnect operations.
 
 ---
@@ -28,10 +31,15 @@ Woka Reel Intelligence integrates with the official **Meta Graph API (v21.0)** u
 
 ### Step 3: Configure Allowed Redirect URIs
 1. In the Instagram Login for Business settings, find **Valid OAuth Redirect URIs**.
-2. Add your application's exact redirect URIs:
-   - Development: `http://localhost:3000/dashboard/instagram/callback`
-   - Staging: `https://staging.woka.io/dashboard/instagram/callback`
-   - Production: `https://app.woka.io/dashboard/instagram/callback`
+2. Add your application's exact redirect URIs based on your callback routing strategy:
+   - **Frontend Callback Route (Default):**
+     - Development: `http://localhost:3000/dashboard/instagram/callback`
+     - Staging: `https://staging.woka.io/dashboard/instagram/callback`
+     - Production: `https://app.woka.io/dashboard/instagram/callback`
+   - **Direct Backend Browser Redirect:**
+     - Development: `http://localhost:8000/api/v1/instagram/callback`
+     - Staging: `https://api-staging.woka.io/api/v1/instagram/callback`
+     - Production: `https://api.woka.io/api/v1/instagram/callback`
 3. Save changes.
 
 ---

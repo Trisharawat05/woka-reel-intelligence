@@ -1,4 +1,5 @@
 import json
+import os
 import time
 from datetime import datetime, timezone, timedelta
 import pytest
@@ -10,7 +11,7 @@ from app.models.instagram import InstagramAccount
 from app.models.reel_intelligence import ReelMetricSnapshot
 from app.models.user import User, Workspace, WorkspaceMember
 from app.models.subscription import Subscription
-from app.security import encrypt_token, decrypt_token, create_access_token, get_password_hash
+from app.security import encrypt_token, decrypt_token, create_access_token, get_password_hash, reset_rate_limits
 from app.services.instagram_service import (
     generate_oauth_state,
     verify_oauth_state,
@@ -19,6 +20,7 @@ from app.services.instagram_service import (
     fetch_instagram_user_profile,
     fetch_instagram_media_list,
     fetch_media_insights,
+    _request_with_retry,
     MetaAPIError,
     MetaTokenExpiredError,
     MetaPermissionError,
@@ -468,3 +470,187 @@ def test_tenant_isolation_cannot_access_or_disconnect_other_tenant_instagram(cli
 
     creator_account = db_session.query(InstagramAccount).filter(InstagramAccount.workspace_id == creator_ws.id).first()
     assert creator_account.is_connected is True
+
+
+# ==============================================================================
+# 6. GET Callback Browser Redirects & Resiliency Tests
+# ==============================================================================
+
+def test_oauth_get_callback_success_redirect(client, db_session, test_creator_user):
+    reset_rate_limits()
+    user, ws = test_creator_user
+    state = generate_oauth_state(ws.id)
+
+    mock_tokens = {
+        "access_token": "mock_60d_token_for_redirect",
+        "user_id": "17841400000000001",
+        "expires_in": 5184000,
+        "permissions": ["instagram_business_basic", "instagram_business_manage_insights"]
+    }
+    mock_profile = {
+        "id": "17841400000000001",
+        "username": "browser_redirect_creator",
+        "name": "Browser Creator",
+        "account_type": "BUSINESS",
+        "media_count": 24
+    }
+
+    with patch("app.services.instagram_service.exchange_code_for_tokens", return_value=mock_tokens), \
+         patch("app.services.instagram_service.fetch_instagram_user_profile", return_value=mock_profile):
+        
+        resp = client.get(
+            f"/api/v1/instagram/callback?code=live_auth_code_789&state={state}",
+            follow_redirects=False
+        )
+        assert resp.status_code == 302
+        location = resp.headers.get("location", "")
+        assert f"{settings.FRONTEND_URL}/dashboard/instagram" in location
+        assert "connected=true" in location
+        assert "browser_redirect_creator" in location
+
+        # Verify database record updated
+        account = db_session.query(InstagramAccount).filter(InstagramAccount.workspace_id == ws.id).first()
+        assert account is not None
+        assert account.is_connected is True
+        assert account.username == "browser_redirect_creator"
+
+
+def test_oauth_get_callback_user_cancellation_redirect(client):
+    reset_rate_limits()
+    resp = client.get(
+        "/api/v1/instagram/callback?error=access_denied&error_reason=user_denied&error_description=Permissions+error",
+        follow_redirects=False
+    )
+    assert resp.status_code == 302
+    location = resp.headers.get("location", "")
+    assert f"{settings.FRONTEND_URL}/dashboard/instagram" in location
+    assert "error=" in location
+    assert "Permissions" in location
+
+
+def test_oauth_get_callback_tampered_state(client):
+    reset_rate_limits()
+    resp = client.get(
+        "/api/v1/instagram/callback?code=live_auth_code_789&state=tampered.fake_signature",
+        follow_redirects=False
+    )
+    assert resp.status_code == 302
+    location = resp.headers.get("location", "")
+    assert f"{settings.FRONTEND_URL}/dashboard/instagram" in location
+    assert "error=" in location
+    assert "tampered" in location.lower() or "invalid" in location.lower()
+
+
+def test_oauth_get_callback_missing_code(client, test_creator_user):
+    reset_rate_limits()
+    user, ws = test_creator_user
+    state = generate_oauth_state(ws.id)
+
+    resp = client.get(
+        f"/api/v1/instagram/callback?state={state}",
+        follow_redirects=False
+    )
+    assert resp.status_code == 302
+    location = resp.headers.get("location", "")
+    assert f"{settings.FRONTEND_URL}/dashboard/instagram" in location
+    assert "error=" in location
+    assert "missing" in location.lower()
+
+
+# ==============================================================================
+# 7. Media List Cursor Pagination & Network Retry Tests
+# ==============================================================================
+
+def test_fetch_instagram_media_list_pagination():
+    page1_data = {
+        "data": [
+            {"id": "media_1", "caption": "Reel 1", "media_type": "VIDEO", "media_product_type": "REELS"},
+            {"id": "media_2", "caption": "Reel 2", "media_type": "VIDEO", "media_product_type": "REELS"}
+        ],
+        "paging": {
+            "cursors": {"after": "cursor_page_2"},
+            "next": "https://graph.instagram.com/v21.0/me/media?after=cursor_page_2"
+        }
+    }
+    page2_data = {
+        "data": [
+            {"id": "media_3", "caption": "Reel 3", "media_type": "VIDEO", "media_product_type": "REELS"},
+            {"id": "media_4", "caption": "Reel 4", "media_type": "VIDEO", "media_product_type": "REELS"}
+        ],
+        "paging": {}
+    }
+
+    resp1 = MagicMock()
+    resp1.status_code = 200
+    resp1.json.return_value = page1_data
+
+    resp2 = MagicMock()
+    resp2.status_code = 200
+    resp2.json.return_value = page2_data
+
+    with patch("app.services.instagram_service._request_with_retry", side_effect=[resp1, resp2]):
+        results = fetch_instagram_media_list("mock_token", limit=10, max_pages=2)
+        assert len(results) == 4
+        ids = [m["id"] for m in results]
+        assert ids == ["media_1", "media_2", "media_3", "media_4"]
+
+
+def test_bounded_retry_on_transient_500_error():
+    resp_500 = MagicMock()
+    resp_500.status_code = 500
+    resp_500.headers = {"content-type": "application/json"}
+    resp_500.json.return_value = {"error": {"message": "Transient Meta server failure", "code": 2}}
+
+    resp_200 = MagicMock()
+    resp_200.status_code = 200
+    resp_200.json.return_value = {"data": []}
+
+    with patch("httpx.Client.get", side_effect=[resp_500, resp_200]) as mock_get:
+        resp = _request_with_retry("GET", "https://graph.instagram.com/test", max_retries=2, base_backoff_seconds=0.001)
+        assert resp.status_code == 200
+        assert mock_get.call_count == 2
+
+
+def test_bounded_retry_exhaustion_on_network_timeout():
+    with patch("httpx.Client.get", side_effect=httpx.ConnectTimeout("Connection timed out")) as mock_get:
+        with pytest.raises(MetaAPIError) as exc_info:
+            _request_with_retry("GET", "https://graph.instagram.com/test", max_retries=2, base_backoff_seconds=0.001)
+        assert "Network error" in exc_info.value.message
+        assert mock_get.call_count == 3
+
+
+# ==============================================================================
+# 8. Health & Readiness Probe Tests
+# ==============================================================================
+
+def test_container_health_probes(client):
+    # Liveness probe
+    liveness_resp = client.get("/healthz")
+    assert liveness_resp.status_code == 200
+    assert liveness_resp.json()["status"] == "alive"
+
+    # Readiness probe (with DB ping)
+    readiness_resp = client.get("/readyz")
+    assert readiness_resp.status_code == 200
+    assert readiness_resp.json()["status"] == "ready"
+    assert readiness_resp.json()["database"] == "connected"
+
+    # API v1 health
+    v1_health = client.get("/api/v1/health")
+    assert v1_health.status_code == 200
+    assert v1_health.json()["status"] == "healthy"
+
+
+# ==============================================================================
+# 9. Opt-in Live Meta Graph API Integration Test
+# ==============================================================================
+
+LIVE_META_TESTING = os.getenv("TEST_LIVE_META_CREDENTIALS", "false").lower() == "true"
+
+@pytest.mark.skipif(not LIVE_META_TESTING, reason="Live Meta API test skipped (TEST_LIVE_META_CREDENTIALS != 'true')")
+def test_live_meta_graph_api_token_inspection():
+    live_token = os.getenv("META_LIVE_TEST_TOKEN")
+    assert live_token, "META_LIVE_TEST_TOKEN must be configured when TEST_LIVE_META_CREDENTIALS=true"
+    profile = fetch_instagram_user_profile(live_token)
+    assert "username" in profile
+    assert "id" in profile

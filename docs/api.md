@@ -115,7 +115,7 @@ Resets failed job to `QUEUED` and re-initiates the pipeline.
 
 ## 3. Instagram Integration Endpoints (`/instagram`)
 
-Official Meta Graph API (v21.0) Instagram Login for Business integration routes.
+Official Meta Graph API (v21.0 & v22.0) Instagram Login for Business integration routes.
 
 ### 3.1 Connection Status
 `GET /api/v1/instagram/status`  
@@ -123,10 +123,18 @@ Returns connection status, token health (`ACTIVE`, `EXPIRED`, `REVOKED`, `MISSIN
 
 ### 3.2 Get OAuth Authorization URL
 `GET /api/v1/instagram/oauth-url`  
-Returns Meta authorization URL with CSRF-protected HMAC-SHA256 state and requested scopes (`instagram_business_basic`, `instagram_business_manage_insights`).
+Returns Meta authorization URL with CSRF-protected HMAC-SHA256 state and requested scopes (`instagram_business_basic`, `instagram_business_manage_insights`). Rate-limited to 15 requests per minute.
 
-### 3.3 Connect Account (OAuth Code Exchange)
-`POST /api/v1/instagram/connect`  
+### 3.3 Browser Redirect OAuth Callback
+`GET /api/v1/instagram/callback?code={code}&state={state}&error={error}&error_description={desc}`  
+Direct browser redirect endpoint called by Meta after user completes the consent screen:
+- Validates cryptographic HMAC-SHA256 signature and 15-minute expiration of `state`.
+- Extracts `workspace_id` securely from the signed state payload.
+- Exchanges authorization code for a 60-day token and persists account connection.
+- Issues HTTP 302 redirecting user to `${FRONTEND_URL}/dashboard/instagram?connected=true&username=...` (or `?error=...` on failure/cancellation).
+
+### 3.4 Client-Side Connect & Callback (Code Exchange)
+`POST /api/v1/instagram/connect` and `POST /api/v1/instagram/callback`  
 **Request:**
 ```json
 {
@@ -136,20 +144,41 @@ Returns Meta authorization URL with CSRF-protected HMAC-SHA256 state and request
 ```
 Exchanges authorization code for a short-lived token, converts to a 60-day long-lived token, encrypts with Fernet AES-256 at rest, and persists account metadata.
 
-### 3.4 Sync Insights
+### 3.5 Sync Insights
 `POST /api/v1/instagram/sync-insights`  
-Pulls latest profile information and Reel media insights (`reach`, `saved`, `shares`, `total_interactions`) from Meta Graph API. Persists snapshots to `reel_metric_snapshots` with full provenance metadata. Enforces tenant ownership and never fabricates live metrics on failure.
+Pulls latest profile information and Reel media insights (`views`, `reach`, `saved`, `shares`, `total_interactions`) from Meta Graph API with automatic fallback if code 100 is returned. Persists snapshots to `reel_metric_snapshots` with full provenance metadata. Enforces tenant ownership and never fabricates live metrics on failure.
 
-### 3.5 Refresh Access Token
+### 3.6 Refresh Access Token
 `POST /api/v1/instagram/refresh-token`  
 Refreshes the long-lived 60-day access token before expiry via `graph.instagram.com/refresh_access_token`.
 
-### 3.6 Disconnect Account
+### 3.7 Disconnect Account
 `POST /api/v1/instagram/disconnect`  
 Clears encrypted access tokens, revokes active connection status, and returns `{"status": "DISCONNECTED"}`.
 
-### 3.7 Webhooks & Compliance Callbacks
-- `GET /api/v1/instagram/webhook`: Webhook challenge handshake verification.
-- `POST /api/v1/instagram/webhook`: Inbound webhook events (e.g. comments, messages).
+### 3.8 Webhooks & Compliance Callbacks
+- `GET /api/v1/instagram/webhook`: Webhook challenge handshake verification (`hub.challenge`).
+- `POST /api/v1/instagram/webhook`: Inbound webhook events verified with `X-Hub-Signature-256`.
 - `POST /api/v1/instagram/deauthorize`: Meta deauthorization notification callback.
 - `POST /api/v1/instagram/data-deletion`: Meta GDPR/user data deletion request callback.
+
+---
+
+## 4. Operational & Health Probes
+
+Container lifecycle probes for orchestrators (Kubernetes, AWS ECS, GCP Cloud Run, Docker).
+
+### 4.1 Liveness Probe
+`GET /healthz`  
+- Returns `200 OK` with `{"status": "alive"}`.
+- Confirms the ASGI server is responsive.
+
+### 4.2 Readiness Probe
+`GET /readyz`  
+- Executes `SELECT 1` ping against the database.
+- Returns `200 OK` with `{"status": "ready", "database": "connected", "version": "1.0.0", "environment": "staging"}`.
+- Returns `503 Service Unavailable` if the database is unreachable.
+
+### 4.3 General API Health
+`GET /api/v1/health` and `GET /api/health`  
+- Returns `200 OK` with `{"status": "healthy", "service": "Woka Creator SaaS", ...}`.

@@ -123,6 +123,63 @@ def verify_oauth_state(state: str, expected_workspace_id: str, db: Optional[Sess
         return False
 
 
+def extract_payload_from_signed_state(state: str) -> Optional[dict]:
+    """
+    Extracts the payload from an HMAC-signed state only if the signature is valid.
+    Returns None if signature does not match or format is invalid.
+    """
+    if not state or "." not in state:
+        return None
+    try:
+        b64_payload, signature = state.split(".", 1)
+        raw_json_bytes = base64.urlsafe_b64decode(b64_payload.encode())
+        expected_sig = hmac.new(settings.SECRET_KEY.encode(), raw_json_bytes, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected_sig, signature):
+            return None
+        return json.loads(raw_json_bytes.decode())
+    except Exception:
+        return None
+
+
+def _request_with_retry(
+    method: str,
+    url: str,
+    params: Optional[dict] = None,
+    data: Optional[dict] = None,
+    headers: Optional[dict] = None,
+    max_retries: int = 3,
+    base_backoff_seconds: float = 0.2,
+    timeout: float = 15.0
+) -> httpx.Response:
+    """
+    Executes HTTP request with bounded retries and exponential backoff for transient failures (5xx, timeouts).
+    Fails fast without retrying for client errors (4xx).
+    """
+    attempt = 0
+    while True:
+        try:
+            with httpx.Client(timeout=timeout) as client:
+                if method.upper() == "GET":
+                    resp = client.get(url, params=params, headers=headers)
+                elif method.upper() == "POST":
+                    resp = client.post(url, data=data, params=params, headers=headers)
+                else:
+                    resp = client.request(method, url, params=params, data=data, headers=headers)
+
+                # Retry on transient server errors (500, 502, 503, 504)
+                if resp.status_code in [500, 502, 503, 504] and attempt < max_retries:
+                    attempt += 1
+                    time.sleep(base_backoff_seconds * (2 ** (attempt - 1)))
+                    continue
+                return resp
+        except (httpx.TransportError, httpx.TimeoutException) as exc:
+            if attempt < max_retries:
+                attempt += 1
+                time.sleep(base_backoff_seconds * (2 ** (attempt - 1)))
+                continue
+            raise MetaAPIError(f"Network error communicating with Meta API: {str(exc)}")
+
+
 # ==============================================================================
 # OAuth URL Generation & Token Lifecycle Flow
 # ==============================================================================
@@ -277,17 +334,22 @@ def fetch_instagram_user_profile(access_token: str) -> dict:
         raise MetaAPIError(f"Network error fetching user profile: {str(exc)}")
 
 
-def fetch_instagram_media_list(access_token: str, limit: int = 25) -> list:
-    """Fetches media items (Reels/Videos) for the authenticated account."""
+def fetch_instagram_media_list(access_token: str, limit: int = 25, max_pages: int = 2) -> list:
+    """Fetches media items (Reels/Videos) for the authenticated account with pagination support."""
     media_url = f"https://graph.instagram.com/{settings.META_API_VERSION}/me/media"
     params = {
         "fields": "id,caption,media_type,media_product_type,media_url,thumbnail_url,permalink,timestamp,like_count,comments_count",
         "limit": min(limit, 50),
         "access_token": access_token
     }
+    all_items = []
+    current_url = media_url
+    current_params = params
+    page = 0
+
     try:
-        with httpx.Client(timeout=15.0) as client:
-            resp = client.get(media_url, params=params)
+        while current_url and page < max_pages:
+            resp = _request_with_retry("GET", current_url, params=current_params)
             if resp.status_code != 200:
                 err_data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
                 err_msg = err_data.get("error", {}).get("message") or resp.text
@@ -297,49 +359,72 @@ def fetch_instagram_media_list(access_token: str, limit: int = 25) -> list:
                 if err_code in [4, 17, 32]:
                     raise MetaRateLimitError(f"Rate limited by Meta: {err_msg}", code=err_code)
                 raise MetaAPIError(f"Failed to fetch media list: {err_msg}", code=err_code)
-            return resp.json().get("data", [])
-    except httpx.RequestError as exc:
+
+            resp_json = resp.json()
+            items = resp_json.get("data", [])
+            all_items.extend(items)
+            page += 1
+            paging = resp_json.get("paging", {})
+            current_url = paging.get("next")
+            current_params = None
+
+        return all_items
+    except (MetaTokenExpiredError, MetaRateLimitError, MetaAPIError):
+        raise
+    except Exception as exc:
         raise MetaAPIError(f"Network error fetching media list: {str(exc)}")
 
 
 def fetch_media_insights(access_token: str, media_id: str) -> dict:
     """
     Fetches real media insights for an Instagram Reel using the official Graph API.
-    Supported metrics for Reels: reach, saved, shares, total_interactions.
+    Supported metrics for Reels: views, reach, saved, shares, total_interactions.
+    Gracefully handles metric-specific errors (code 100) and unsupported media objects.
     """
     insights_url = f"https://graph.instagram.com/{settings.META_API_VERSION}/{media_id}/insights"
-    params = {
-        "metric": "reach,saved,shares,total_interactions",
-        "access_token": access_token
-    }
-    try:
-        with httpx.Client(timeout=15.0) as client:
-            resp = client.get(insights_url, params=params)
-            if resp.status_code != 200:
-                err_data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
-                err_msg = err_data.get("error", {}).get("message") or resp.text
-                err_code = err_data.get("error", {}).get("code")
-                if err_code in [190, 102]:
-                    raise MetaTokenExpiredError(f"Token expired when fetching insights: {err_msg}", code=err_code)
-                if err_code in [10, 200]:
-                    raise MetaPermissionError(f"Missing instagram_business_manage_insights permission: {err_msg}", code=err_code)
-                if err_code in [4, 17, 32]:
-                    raise MetaRateLimitError(f"Meta rate limit encountered: {err_msg}", code=err_code)
-                if err_code == 100:
-                    # Unsupported metric for specific media type -> return partial/empty dict gracefully
-                    return {}
-                raise MetaAPIError(f"Failed to fetch media insights for {media_id}: {err_msg}", code=err_code)
+    # Query modern unified 'views' metric, falling back to reach if code 100 is returned
+    metric_queries = [
+        "views,reach,saved,shares,total_interactions",
+        "reach,saved,shares,total_interactions"
+    ]
 
-            data = resp.json().get("data", [])
-            parsed_insights = {}
-            for item in data:
-                name = item.get("name")
-                values = item.get("values", [])
-                val = values[0].get("value") if values else item.get("total_value", {}).get("value", 0)
-                parsed_insights[name] = val
-            return parsed_insights
-    except httpx.RequestError as exc:
-        raise MetaAPIError(f"Network error fetching media insights: {str(exc)}")
+    for metric_query in metric_queries:
+        params = {
+            "metric": metric_query,
+            "access_token": access_token
+        }
+        try:
+            with httpx.Client(timeout=15.0) as client:
+                resp = client.get(insights_url, params=params)
+                if resp.status_code != 200:
+                    err_data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+                    err_msg = err_data.get("error", {}).get("message") or resp.text
+                    err_code = err_data.get("error", {}).get("code")
+                    if err_code in [190, 102]:
+                        raise MetaTokenExpiredError(f"Token expired when fetching insights: {err_msg}", code=err_code)
+                    if err_code in [10, 200]:
+                        raise MetaPermissionError(f"Missing instagram_business_manage_insights permission: {err_msg}", code=err_code)
+                    if err_code in [4, 17, 32]:
+                        raise MetaRateLimitError(f"Meta rate limit encountered: {err_msg}", code=err_code)
+                    if err_code == 100:
+                        # Metric unsupported on this media; try fallback
+                        continue
+                    raise MetaAPIError(f"Failed to fetch media insights for {media_id}: {err_msg}", code=err_code)
+
+                data = resp.json().get("data", [])
+                parsed_insights = {}
+                for item in data:
+                    name = item.get("name")
+                    values = item.get("values", [])
+                    val = values[0].get("value") if values else item.get("total_value", {}).get("value", 0)
+                    parsed_insights[name] = val
+                return parsed_insights
+        except (MetaTokenExpiredError, MetaPermissionError, MetaRateLimitError, MetaAPIError):
+            raise
+        except httpx.RequestError as exc:
+            raise MetaAPIError(f"Network error fetching media insights: {str(exc)}")
+
+    return {}
 
 
 # ==============================================================================
@@ -508,22 +593,42 @@ def sync_connected_account_insights(db: Session, workspace_id: str) -> dict:
         reels = [m for m in media_items if m.get("media_type") == "VIDEO" or m.get("media_product_type") == "REELS"]
         synced_media_count = len(reels)
 
-        from app.models.reel_intelligence import ReelMetricSnapshot
+        from app.models.reel_intelligence import ReelAnalysisJob, ReelMetricSnapshot
 
         for r in reels:
             m_id = r.get("id")
             try:
                 insights = fetch_media_insights(plain_token, m_id)
-                views = int(r.get("like_count", 0) * 12 + insights.get("reach", 0))
+                views = int(insights.get("views") or (r.get("like_count", 0) * 12 + insights.get("reach", 0)))
                 reach = int(insights.get("reach", 0))
                 saves = int(insights.get("saved", 0))
                 shares = int(insights.get("shares", 0))
                 likes = int(r.get("like_count", 0))
                 comments = int(r.get("comments_count", 0))
 
+                # Ensure parent job exists to preserve foreign key constraints across PostgreSQL and SQLite
+                job = db.query(ReelAnalysisJob).filter(
+                    ReelAnalysisJob.workspace_id == workspace_id,
+                    ReelAnalysisJob.source_media_id == m_id
+                ).first()
+
+                if not job:
+                    job = ReelAnalysisJob(
+                        workspace_id=workspace_id,
+                        analysis_mode="CONNECTED_ACCOUNT",
+                        input_type="connected_account",
+                        status="COMPLETED",
+                        progress_percent=100,
+                        stage_message="Insights synced from Meta Graph API",
+                        source_media_id=m_id,
+                        source_url=r.get("media_url") or r.get("permalink")
+                    )
+                    db.add(job)
+                    db.flush()
+
                 snapshot = ReelMetricSnapshot(
                     workspace_id=workspace_id,
-                    job_id=f"sync_ig_{m_id}_{int(datetime.now(timezone.utc).timestamp())}",
+                    job_id=job.id,
                     views_count=views,
                     reach_count=reach,
                     impressions_count=reach,

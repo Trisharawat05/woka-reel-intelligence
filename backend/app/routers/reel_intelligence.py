@@ -18,7 +18,7 @@ from app.schemas.reel_intelligence import (
     ReelComparisonRequest,
     ReelComparisonResponse
 )
-from app.security import get_current_user
+from app.security import get_current_user, rate_limit
 from app.services.auth_service import get_or_create_workspace
 from app.services.reel_intelligence_service import (
     create_url_analysis_job,
@@ -70,7 +70,8 @@ def analyze_public_url(
     req: AnalyzePublicUrlRequest,
     background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    _limiter: bool = Depends(rate_limit(max_requests=20, window_seconds=60))
 ):
     """
     Submits a public Instagram Reel or video URL for end-to-end AI analysis.
@@ -96,7 +97,8 @@ def analyze_video_upload(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    _limiter: bool = Depends(rate_limit(max_requests=20, window_seconds=60))
 ):
     """
     Uploads a video file (.mp4, .mov, .webm) and triggers full video intelligence analysis.
@@ -112,7 +114,8 @@ def analyze_connected_reel(
     req: AnalyzeConnectedReelRequest,
     background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    _limiter: bool = Depends(rate_limit(max_requests=20, window_seconds=60))
 ):
     """
     Submits a Reel from the creator's connected Instagram professional account.

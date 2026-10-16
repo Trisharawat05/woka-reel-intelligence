@@ -1,5 +1,7 @@
 import {
-  User, Workspace, InstagramAccount, Automation, AutomationLog,
+  User, Workspace, InstagramAccount, InstagramStatusResponse,
+  InstagramSyncInsightsResponse, InstagramRefreshTokenResponse,
+  Automation, AutomationLog,
   AnalyticsResponse, CreatorProfile, BrandCampaign, CampaignApplication,
   Invoice, Subscription, NotificationItem,
   ReelAnalysisJob, ReelReport, ReelReportSummary, ReelComparison
@@ -86,8 +88,37 @@ class ApiClient {
     return this.request("/instagram/account");
   }
 
-  async getOAuthUrl(): Promise<{ oauth_url: string; state: string }> {
+  async getInstagramStatus(): Promise<InstagramStatusResponse> {
+    return this.request("/instagram/status");
+  }
+
+  async getOAuthUrl(): Promise<{ oauth_url: string; state: string; scopes_requested?: string[]; expires_in_seconds?: number }> {
     return this.request("/instagram/oauth-url");
+  }
+
+  async connectInstagram(code: string, state: string): Promise<InstagramAccount> {
+    return this.request("/instagram/connect", {
+      method: "POST",
+      body: JSON.stringify({ code, state }),
+    });
+  }
+
+  async syncInstagramInsights(): Promise<InstagramSyncInsightsResponse> {
+    return this.request("/instagram/sync-insights", {
+      method: "POST",
+    });
+  }
+
+  async refreshInstagramToken(): Promise<InstagramRefreshTokenResponse> {
+    return this.request("/instagram/refresh-token", {
+      method: "POST",
+    });
+  }
+
+  async disconnectInstagram(): Promise<{ status: string; message: string }> {
+    return this.request("/instagram/disconnect", {
+      method: "POST",
+    });
   }
 
   async toggleSandbox(enabled: boolean, username?: string, followers_count?: number): Promise<InstagramAccount> {

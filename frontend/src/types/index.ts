@@ -27,7 +27,38 @@ export interface InstagramAccount {
   followers_count: number;
   media_count: number;
   token_expires_at?: string;
+  granted_permissions?: string;
+  is_token_expired?: boolean;
   created_at: string;
+}
+
+export interface InstagramStatusResponse {
+  is_connected: boolean;
+  account?: InstagramAccount | null;
+  has_insights_permission: boolean;
+  token_status: "ACTIVE" | "EXPIRED" | "REVOKED" | "MISSING";
+  api_version: string;
+  message?: string;
+}
+
+export interface InstagramSyncInsightsResponse {
+  status: "SUCCESS" | "PARTIAL" | "FAILED";
+  synced_media_count: number;
+  metric_snapshots_created: number;
+  synced_at: string;
+  provenance: {
+    source_endpoint: string;
+    api_version: string;
+    retrieved_at: string;
+    mode: string;
+  };
+  errors: string[];
+}
+
+export interface InstagramRefreshTokenResponse {
+  status: string;
+  token_expires_at?: string;
+  message: string;
 }
 
 export interface Automation {

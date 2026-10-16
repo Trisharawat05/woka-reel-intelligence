@@ -54,7 +54,33 @@ app.include_router(notifications.router, prefix=settings.API_V1_STR)
 app.include_router(admin.router, prefix=settings.API_V1_STR)
 app.include_router(reel_intelligence.router, prefix=settings.API_V1_STR)
 
+@app.get("/healthz", tags=["Health"])
+def liveness_probe():
+    """Standard container liveness probe."""
+    return {"status": "alive"}
+
+@app.get("/readyz", tags=["Health"])
+def readiness_probe():
+    """Standard container readiness probe verifying database connectivity."""
+    try:
+        from sqlalchemy import text
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        return {
+            "status": "ready",
+            "database": "connected",
+            "version": settings.VERSION,
+            "environment": settings.ENVIRONMENT
+        }
+    except Exception as exc:
+        from fastapi import HTTPException, status
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Database readiness check failed: {str(exc)}"
+        )
+
 @app.get("/api/health", tags=["Health"])
+@app.get(f"{settings.API_V1_STR}/health", tags=["Health"])
 def health_check():
     return {
         "status": "healthy",
@@ -69,3 +95,4 @@ def root():
         "message": "Welcome to Woka API. Visit /api/v1/docs for OpenAPI documentation.",
         "status": "operational"
     }
+

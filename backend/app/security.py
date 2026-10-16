@@ -127,3 +127,48 @@ def require_roles(allowed_roles: List[str]):
             )
         return current_user
     return role_checker
+
+
+# ==============================================================================
+# Sliding Window Rate Limiting Dependency
+# ==============================================================================
+
+import time
+from collections import defaultdict
+from fastapi import Request
+
+_rate_limit_records = defaultdict(list)
+
+def rate_limit(max_requests: int = 30, window_seconds: int = 60, key_func=None):
+    """
+    Dependency for sliding-window rate limiting per client IP or authenticated entity.
+    Returns HTTP 429 Too Many Requests if threshold is exceeded within the rolling window.
+    """
+    def limiter(request: Request):
+        now = time.time()
+        client_ip = request.client.host if request.client else "127.0.0.1"
+        ident = key_func(request) if key_func else client_ip
+        scope_key = f"{request.url.path}:{ident}"
+
+        # Evict timestamps older than rolling window
+        history = _rate_limit_records[scope_key]
+        _rate_limit_records[scope_key] = [ts for ts in history if now - ts < window_seconds]
+
+        if len(_rate_limit_records[scope_key]) >= max_requests:
+            oldest = _rate_limit_records[scope_key][0]
+            retry_after = max(1, int(window_seconds - (now - oldest)))
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=f"Rate limit exceeded. Maximum {max_requests} requests per {window_seconds}s.",
+                headers={"Retry-After": str(retry_after)}
+            )
+        _rate_limit_records[scope_key].append(now)
+        return True
+
+    return limiter
+
+
+def reset_rate_limits():
+    """Helper for testing to reset rate limit tracking."""
+    _rate_limit_records.clear()
+

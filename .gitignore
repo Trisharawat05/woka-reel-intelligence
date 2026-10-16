@@ -53,3 +53,7 @@ staging/ssl/*.key
 media_storage/
 backend/media_storage/
 
+# TypeScript Build Info
+*.tsbuildinfo
+
+

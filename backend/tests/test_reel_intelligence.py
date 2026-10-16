@@ -378,3 +378,92 @@ def test_report_history_listing_and_filtering(client, auth_headers):
         assert search_res.status_code == 200
         assert len(search_res.json()) >= 1
 
+
+def test_comparison_security_and_validation(client, auth_headers, db_session, test_creator_user):
+    """Verifies bounds (2-5), duplicate detection, missing IDs, and cross-workspace isolation for comparisons."""
+    # Create two valid reports for the current workspace
+    j1 = client.post("/api/v1/reel-intelligence/jobs/connected", json={"media_id": "comp_sec_1"}, headers=auth_headers)
+    j2 = client.post("/api/v1/reel-intelligence/jobs/connected", json={"media_id": "comp_sec_2"}, headers=auth_headers)
+    r1_id = client.get(f"/api/v1/reel-intelligence/jobs/{j1.json()['id']}", headers=auth_headers).json()["report_id"]
+    r2_id = client.get(f"/api/v1/reel-intelligence/jobs/{j2.json()['id']}", headers=auth_headers).json()["report_id"]
+
+    # 1. Less than 2 items -> 422 Unprocessable Entity (Pydantic schema validation)
+    res_too_few = client.post("/api/v1/reel-intelligence/compare", json={"report_ids": [r1_id]}, headers=auth_headers)
+    assert res_too_few.status_code == 422
+
+    # 2. More than 5 items -> 422 Unprocessable Entity
+    res_too_many = client.post(
+        "/api/v1/reel-intelligence/compare",
+        json={"report_ids": [r1_id, r2_id, "id3", "id4", "id5", "id6"]},
+        headers=auth_headers
+    )
+    assert res_too_many.status_code == 422
+
+    # 3. Duplicate IDs in request -> 400 Bad Request
+    res_dup = client.post(
+        "/api/v1/reel-intelligence/compare",
+        json={"report_ids": [r1_id, r1_id]},
+        headers=auth_headers
+    )
+    assert res_dup.status_code == 400
+    assert "duplicate" in res_dup.json()["detail"].lower()
+
+    # 4. Non-existent report ID -> 404 Not Found
+    res_missing = client.post(
+        "/api/v1/reel-intelligence/compare",
+        json={"report_ids": [r1_id, "non_existent_rep_uuid"]},
+        headers=auth_headers
+    )
+    assert res_missing.status_code == 404
+    assert "not found" in res_missing.json()["detail"].lower()
+
+    # 5. Cross-tenant attempt: Other user tries to compare with Creator's report
+    other_user = User(
+        email="tenant_comp_sec@other.io",
+        hashed_password=get_password_hash("OtherPass123!"),
+        full_name="Other Comp User",
+        role="CREATOR"
+    )
+    db_session.add(other_user)
+    db_session.flush()
+    other_ws = Workspace(name="Other Workspace Comp", owner_id=other_user.id)
+    db_session.add(other_ws)
+    db_session.flush()
+    db_session.add(WorkspaceMember(workspace_id=other_ws.id, user_id=other_user.id, role_in_workspace="OWNER"))
+    db_session.commit()
+
+    other_token = create_access_token(data={"sub": other_user.id, "role": other_user.role, "workspace_id": other_ws.id})
+    other_headers = {"Authorization": f"Bearer {other_token}"}
+
+    # Other tenant creates 1 valid report in their own workspace
+    other_j = client.post(
+        "/api/v1/reel-intelligence/jobs/url",
+        json={"url": "https://www.instagram.com/reel/COtherTenantSec1/"},
+        headers=other_headers
+    )
+    assert other_j.status_code == 202
+    other_r_id = client.get(f"/api/v1/reel-intelligence/jobs/{other_j.json()['id']}", headers=other_headers).json()["report_id"]
+
+    # Other tenant attempts to compare their report with Creator's r1_id -> 404 Not Found (Cross-tenant protected!)
+    cross_res = client.post(
+        "/api/v1/reel-intelligence/compare",
+        json={"report_ids": [other_r_id, r1_id]},
+        headers=other_headers
+    )
+    assert cross_res.status_code == 404
+    assert "not found" in cross_res.json()["detail"].lower()
+
+
+def test_ssrf_advanced_dns_and_metadata_blocking(client, auth_headers):
+    """Verifies that cloud metadata hostnames, nip.io private mappings, and IPv6 loopback are blocked."""
+    blocked_urls = [
+        "http://metadata.google.internal/computeMetadata/v1/video.mp4",
+        "http://instance-data/latest/meta-data/reel.mp4",
+        "http://127.0.0.1.nip.io/exploit.mp4",
+        "http://[::1]/internal.mp4"
+    ]
+    for b_url in blocked_urls:
+        res = client.post("/api/v1/reel-intelligence/jobs/url", json={"url": b_url}, headers=auth_headers)
+        assert res.status_code == 422, f"Expected 422 for blocked URL '{b_url}', got {res.status_code}: {res.text}"
+
+

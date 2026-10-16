@@ -104,20 +104,41 @@ def validate_instagram_reel_url(url: str) -> Dict[str, Any]:
         )
 
     # SSRF Protection: verify host is not private/loopback/link-local/metadata
-    if hostname in ["localhost", "127.0.0.1", "0.0.0.0", "::1", "metadata.google.internal"]:
+    restricted_hostnames = {
+        "localhost", "127.0.0.1", "0.0.0.0", "::1",
+        "metadata.google.internal", "instance-data", "metadata"
+    }
+    if (
+        hostname in restricted_hostnames
+        or hostname.endswith(".localhost")
+        or hostname.endswith(".local")
+        or hostname.endswith(".internal")
+        or (hostname.endswith(".nip.io") and any(is_ip_private_or_restricted(part) for part in hostname.split(".")))
+    ):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="Access to private or local network addresses is forbidden."
         )
 
     # If hostname is an IP address directly, check if private
+    if is_ip_private_or_restricted(hostname):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Access to private or internal network addresses is forbidden."
+        )
+
+    # DNS Resolution Check: Verify hostname does not resolve to private/loopback/metadata IP
     try:
-        if is_ip_private_or_restricted(hostname):
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="Access to private or internal network addresses is forbidden."
-            )
-    except ValueError:
+        addr_info = socket.getaddrinfo(hostname, None)
+        for _, _, _, _, sockaddr in addr_info:
+            ip_str = sockaddr[0]
+            if is_ip_private_or_restricted(ip_str):
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="Access to private, link-local, or metadata network addresses is forbidden."
+                )
+    except socket.gaierror:
+        # Hostname cannot be resolved via DNS (offline test environment)
         pass
 
     # Matches instagram.com/reel/CODE/, instagram.com/p/CODE/, or direct video files (.mp4/.mov)
@@ -513,10 +534,30 @@ def list_reports(
 
 def compare_reels(db: Session, workspace_id: str, report_ids: List[str]) -> Dict[str, Any]:
     """Compares 2 to 5 reports, computing deltas, strengths, and AI synthesis."""
+    if len(report_ids) < 2 or len(report_ids) > 5:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Comparison requires between 2 and 5 report IDs."
+        )
+
+    if len(set(report_ids)) != len(report_ids):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Duplicate report IDs provided for comparison."
+        )
+
     reports = db.query(ReelReport).filter(
         ReelReport.id.in_(report_ids),
         ReelReport.workspace_id == workspace_id
     ).all()
+
+    found_ids = {r.id for r in reports}
+    missing_ids = [rid for rid in report_ids if rid not in found_ids]
+    if missing_ids:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Report(s) not found in your workspace: {', '.join(missing_ids)}"
+        )
 
     if len(reports) < 2:
         raise HTTPException(

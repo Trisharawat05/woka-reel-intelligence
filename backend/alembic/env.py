@@ -7,7 +7,9 @@ from sqlalchemy import pool
 
 from alembic import context
 
-sys.path.insert(0, os.path.abspath("."))
+backend_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if backend_dir not in sys.path:
+    sys.path.insert(0, backend_dir)
 
 from app.config import settings
 from app.models import Base

@@ -88,6 +88,8 @@ def generate_oauth_state(workspace_id: str) -> str:
     return f"{b64_payload}.{sig}"
 
 
+_used_oauth_nonces: set = set()
+
 def verify_oauth_state(state: str, expected_workspace_id: str, db: Optional[Session] = None, max_age_seconds: int = 900) -> bool:
     """Verifies HMAC signature, timestamp expiration, workspace binding, and prevents replay attacks."""
     if not state or "." not in state:
@@ -110,13 +112,18 @@ def verify_oauth_state(state: str, expected_workspace_id: str, db: Optional[Sess
 
         # Nonce Replay Prevention
         nonce = payload.get("nonce")
-        if db is not None and nonce:
-            from app.models.user import UsedOAuthNonce
-            existing = db.query(UsedOAuthNonce).filter(UsedOAuthNonce.nonce == nonce).first()
-            if existing:
-                return False  # Replay detected
-            db.add(UsedOAuthNonce(nonce=nonce, workspace_id=expected_workspace_id))
-            db.commit()
+        if nonce:
+            if db is not None:
+                from app.models.user import UsedOAuthNonce
+                existing = db.query(UsedOAuthNonce).filter(UsedOAuthNonce.nonce == nonce).first()
+                if existing:
+                    return False  # Replay detected
+                db.add(UsedOAuthNonce(nonce=nonce, workspace_id=expected_workspace_id))
+                db.commit()
+            else:
+                if nonce in _used_oauth_nonces:
+                    return False  # Replay detected
+                _used_oauth_nonces.add(nonce)
 
         return True
     except Exception:

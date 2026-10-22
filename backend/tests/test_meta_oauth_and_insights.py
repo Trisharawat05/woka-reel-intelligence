@@ -654,3 +654,226 @@ def test_live_meta_graph_api_token_inspection():
     profile = fetch_instagram_user_profile(live_token)
     assert "username" in profile
     assert "id" in profile
+
+
+# ==============================================================================
+# 10. Verified cURL Command Source of Truth & Media Edge Tests
+# ==============================================================================
+
+def test_fetch_instagram_media_list_with_curl_user_id_and_fields():
+    """
+    Tests translating the verified cURL command:
+    curl -G 'https://graph.instagram.com/v25.0/17841458643277126/media' \
+      --data-urlencode 'fields=id,caption,media_type,media_url,permalink,timestamp' \
+      --data-urlencode 'limit=10'
+    """
+    target_user_id = "17841458643277126"
+    test_token = "mock_curl_token_igaa_verified"
+    curl_fields = "id,caption,media_type,media_url,permalink,timestamp"
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.headers = {"content-type": "application/json"}
+    mock_resp.json.return_value = {
+        "data": [
+            {
+                "id": "17985234567890123",
+                "caption": "Reel testing verified fields #creators",
+                "media_type": "VIDEO",
+                "media_url": "https://scontent.cdninstagram.com/v/test_reel_url.mp4",
+                "permalink": "https://www.instagram.com/reel/C7XyZ123abc/",
+                "timestamp": "2026-10-15T18:30:00+0000"
+            },
+            {
+                "id": "17985234567890124",
+                "caption": "Photo post for carousel comparison",
+                "media_type": "IMAGE",
+                "media_url": "https://scontent.cdninstagram.com/v/test_image.jpg",
+                "permalink": "https://www.instagram.com/p/C7XyZ123def/",
+                "timestamp": "2026-10-14T12:00:00+0000"
+            }
+        ],
+        "paging": {
+            "cursors": {"before": "cur_b", "after": "cur_a"}
+        }
+    }
+
+    with patch("app.services.instagram_service._request_with_retry", return_value=mock_resp) as mock_req:
+        items = fetch_instagram_media_list(
+            access_token=test_token,
+            user_id=target_user_id,
+            fields=curl_fields,
+            limit=10
+        )
+        assert len(items) == 2
+        first = items[0]
+        assert first["id"] == "17985234567890123"
+        assert first["media_type"] == "VIDEO"
+        assert first["media_url"].startswith("https://scontent.cdninstagram.com")
+        assert first["permalink"] == "https://www.instagram.com/reel/C7XyZ123abc/"
+        assert first["timestamp"] == "2026-10-15T18:30:00+0000"
+
+        # Verify exact URL construction and parameters
+        call_args = mock_req.call_args
+        assert f"/{target_user_id}/media" in call_args[0][1]
+        assert call_args[1]["params"]["fields"] == curl_fields
+        assert call_args[1]["params"]["limit"] == 10
+        assert call_args[1]["params"]["access_token"] == test_token
+
+
+def test_fetch_instagram_media_list_code_100_fallback_to_curl_fields():
+    """
+    Ensures that when Meta rejects extended fields (code 100), the system
+    automatically falls back to the exact verified cURL fields without failing the request.
+    """
+    target_user_id = "17841458643277126"
+    test_token = "mock_curl_token_fallback"
+
+    err_100_resp = MagicMock()
+    err_100_resp.status_code = 400
+    err_100_resp.headers = {"content-type": "application/json"}
+    err_100_resp.json.return_value = {
+        "error": {
+            "message": "(#100) Tried accessing nonexisting field (like_count) on node type (Media)",
+            "type": "OAuthException",
+            "code": 100
+        }
+    }
+
+    success_resp = MagicMock()
+    success_resp.status_code = 200
+    success_resp.headers = {"content-type": "application/json"}
+    success_resp.json.return_value = {
+        "data": [
+            {
+                "id": "17985234567890123",
+                "caption": "Reel retrieved via fallback",
+                "media_type": "VIDEO",
+                "media_url": "https://scontent.cdninstagram.com/v/test.mp4",
+                "permalink": "https://www.instagram.com/reel/C7XyZ123abc/",
+                "timestamp": "2026-10-15T18:30:00+0000"
+            }
+        ]
+    }
+
+    with patch("app.services.instagram_service._request_with_retry", side_effect=[err_100_resp, success_resp]) as mock_req:
+        items = fetch_instagram_media_list(access_token=test_token, user_id=target_user_id, limit=10)
+        assert len(items) == 1
+        assert items[0]["id"] == "17985234567890123"
+        # First call used extended fields; second call fell back to verified cURL fields
+        assert mock_req.call_count == 2
+        second_call = mock_req.call_args_list[1]
+        assert second_call[1]["params"]["fields"] == "id,caption,media_type,media_url,permalink,timestamp"
+
+
+def test_fetch_instagram_media_list_token_expired_code_190():
+    """Verifies that an invalidated/expired token (code 190) raises MetaTokenExpiredError."""
+    err_190_resp = MagicMock()
+    err_190_resp.status_code = 400
+    err_190_resp.headers = {"content-type": "application/json"}
+    err_190_resp.json.return_value = {
+        "error": {
+            "message": "Error validating access token: The session has been invalidated because the user changed their password.",
+            "type": "OAuthException",
+            "code": 190,
+            "error_subcode": 0
+        }
+    }
+
+    with patch("app.services.instagram_service._request_with_retry", return_value=err_190_resp):
+        with pytest.raises(MetaTokenExpiredError) as exc_info:
+            fetch_instagram_media_list(access_token="expired_igaa_token")
+        assert "expired or revoked" in str(exc_info.value).lower()
+
+
+def test_get_instagram_media_endpoint_sandbox(client, auth_headers):
+    """Tests the new GET /api/v1/instagram/media endpoint in sandbox mode."""
+    resp = client.get("/api/v1/instagram/media?limit=5", headers=auth_headers)
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["is_sandbox"] is True
+    assert len(data["data"]) >= 1
+    media = data["data"][0]
+    assert "id" in media
+    assert "caption" in media
+    assert "media_type" in media
+    assert "media_url" in media
+    assert "permalink" in media
+    assert "timestamp" in media
+
+
+def test_get_instagram_media_endpoint_live_mocked(client, auth_headers, test_creator_user, db_session):
+    """Tests GET /api/v1/instagram/media with a connected non-sandbox account and mocked Graph API."""
+    user, ws = test_creator_user
+    acc = db_session.query(InstagramAccount).filter(InstagramAccount.workspace_id == ws.id).first()
+    acc.is_sandbox = False
+    acc.encrypted_access_token = encrypt_token("mock_valid_igaa_token")
+    acc.ig_user_id = "17841458643277126"
+    db_session.commit()
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.headers = {"content-type": "application/json"}
+    mock_resp.json.return_value = {
+        "data": [
+            {
+                "id": "17841458643277126_reel_1",
+                "caption": "Live test caption from cURL response",
+                "media_type": "VIDEO",
+                "media_url": "https://scontent.cdninstagram.com/test.mp4",
+                "permalink": "https://www.instagram.com/reel/Ctest/",
+                "timestamp": "2026-10-20T10:00:00+0000"
+            }
+        ]
+    }
+
+    with patch("app.services.instagram_service._request_with_retry", return_value=mock_resp):
+        resp = client.get("/api/v1/instagram/media?limit=5", headers=auth_headers)
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["is_sandbox"] is False
+        assert body["count"] == 1
+        assert body["data"][0]["permalink"] == "https://www.instagram.com/reel/Ctest/"
+
+
+def test_list_connected_account_reels_preserves_permalink_and_no_fabricated_views(client, auth_headers, test_creator_user, db_session):
+    """Verifies GET /api/v1/reel-intelligence/connected-reels preserves permalink and avoids fabricated views."""
+    user, ws = test_creator_user
+    acc = db_session.query(InstagramAccount).filter(InstagramAccount.workspace_id == ws.id).first()
+    acc.is_sandbox = False
+    acc.encrypted_access_token = encrypt_token("mock_live_token")
+    acc.ig_user_id = "17841458643277126"
+    db_session.commit()
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.headers = {"content-type": "application/json"}
+    mock_resp.json.return_value = {
+        "data": [
+            {
+                "id": "reel_no_fabrication_101",
+                "caption": "Real Reel without fabricated views",
+                "media_type": "VIDEO",
+                "media_url": "https://scontent.cdninstagram.com/reel.mp4",
+                "permalink": "https://www.instagram.com/reel/C_nofab/",
+                "timestamp": "2026-10-21T12:00:00+0000",
+                "like_count": 50,
+                "comments_count": 5
+            }
+        ]
+    }
+
+    with patch("app.services.instagram_service._request_with_retry", return_value=mock_resp):
+        resp = client.get("/api/v1/reel-intelligence/connected-reels", headers=auth_headers)
+        assert resp.status_code == 200
+        reels = resp.json()["reels"]
+        assert len(reels) == 1
+        r = reels[0]
+        assert r["media_id"] == "reel_no_fabrication_101"
+        assert r["permalink"] == "https://www.instagram.com/reel/C_nofab/"
+        assert r["likes"] == 50
+        assert r["comments"] == 5
+        # Views must NOT be fabricated as 50 * 10 = 500!
+        assert r["views"] == 0
+        assert r["has_synced_insights"] is False
+

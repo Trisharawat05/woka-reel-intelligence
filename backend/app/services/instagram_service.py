@@ -341,11 +341,28 @@ def fetch_instagram_user_profile(access_token: str) -> dict:
         raise MetaAPIError(f"Network error fetching user profile: {str(exc)}")
 
 
-def fetch_instagram_media_list(access_token: str, limit: int = 25, max_pages: int = 2) -> list:
-    """Fetches media items (Reels/Videos) for the authenticated account with pagination support."""
-    media_url = f"https://graph.instagram.com/{settings.META_API_VERSION}/me/media"
+def fetch_instagram_media_list(
+    access_token: str,
+    user_id: Optional[str] = None,
+    fields: Optional[str] = None,
+    limit: int = 25,
+    max_pages: int = 2
+) -> list:
+    """
+    Fetches media items (Reels/Videos) for the authenticated account with pagination support.
+    Supports querying specific user_id (e.g. 17841458643277126 from cURL source of truth) or default 'me'.
+    Preserves verified cURL fields: id, caption, media_type, media_url, permalink, timestamp.
+    Gracefully falls back to core verified fields if extended fields are unsupported (Meta code 100).
+    """
+    target = user_id or "me"
+    media_url = f"https://graph.instagram.com/{settings.META_API_VERSION}/{target}/media"
+    
+    verified_curl_fields = "id,caption,media_type,media_url,permalink,timestamp"
+    default_fields = f"{verified_curl_fields},thumbnail_url,media_product_type,like_count,comments_count"
+    query_fields = fields or default_fields
+
     params = {
-        "fields": "id,caption,media_type,media_product_type,media_url,thumbnail_url,permalink,timestamp,like_count,comments_count",
+        "fields": query_fields,
         "limit": min(limit, 50),
         "access_token": access_token
     }
@@ -362,9 +379,13 @@ def fetch_instagram_media_list(access_token: str, limit: int = 25, max_pages: in
                 err_msg = err_data.get("error", {}).get("message") or resp.text
                 err_code = err_data.get("error", {}).get("code")
                 if err_code in [190, 102]:
-                    raise MetaTokenExpiredError(f"Access token expired: {err_msg}", code=err_code)
+                    raise MetaTokenExpiredError(f"Access token expired or revoked: {err_msg}", code=err_code)
                 if err_code in [4, 17, 32]:
                     raise MetaRateLimitError(f"Rate limited by Meta: {err_msg}", code=err_code)
+                if err_code == 100 and current_params and current_params.get("fields") != verified_curl_fields:
+                    # Extended fields rejected; fallback to exact verified cURL fields
+                    current_params["fields"] = verified_curl_fields
+                    continue
                 raise MetaAPIError(f"Failed to fetch media list: {err_msg}", code=err_code)
 
             resp_json = resp.json()
@@ -602,7 +623,7 @@ def sync_connected_account_insights(db: Session, workspace_id: str) -> dict:
             errors.append(f"Profile refresh failed: {str(e)}")
 
         # 2. Fetch media list
-        media_items = fetch_instagram_media_list(plain_token, limit=20)
+        media_items = fetch_instagram_media_list(plain_token, user_id=account.ig_user_id, limit=20)
         reels = [m for m in media_items if m.get("media_type") == "VIDEO" or m.get("media_product_type") == "REELS"]
         synced_media_count = len(reels)
 
@@ -612,12 +633,13 @@ def sync_connected_account_insights(db: Session, workspace_id: str) -> dict:
             m_id = r.get("id")
             try:
                 insights = fetch_media_insights(plain_token, m_id)
-                views = int(insights.get("views") or (r.get("like_count", 0) * 12 + insights.get("reach", 0)))
+                # Map strictly verified Meta insights metrics without fabricating formulas
                 reach = int(insights.get("reach", 0))
+                views = int(insights.get("views")) if insights.get("views") is not None else reach
                 saves = int(insights.get("saved", 0))
                 shares = int(insights.get("shares", 0))
-                likes = int(r.get("like_count", 0))
-                comments = int(r.get("comments_count", 0))
+                likes = int(r.get("like_count", 0)) if r.get("like_count") is not None else 0
+                comments = int(r.get("comments_count", 0)) if r.get("comments_count") is not None else 0
 
                 # Ensure parent job exists to preserve foreign key constraints across PostgreSQL and SQLite
                 job = db.query(ReelAnalysisJob).filter(

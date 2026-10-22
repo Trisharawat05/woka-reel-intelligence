@@ -53,6 +53,74 @@ def get_account(current_user: User = Depends(get_current_user), db: Session = De
         return None
     return InstagramAccountResponse.model_validate(account)
 
+@router.get("/media")
+def get_instagram_media(
+    limit: int = Query(10, ge=1, le=50),
+    fields: Optional[str] = Query(None),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    _limiter: bool = Depends(rate_limit(max_requests=20, window_seconds=60))
+):
+    """
+    Directly queries media items for the workspace's connected Instagram account.
+    Translates the verified Instagram Graph API media cURL command into an authenticated, tenant-isolated API.
+    Defaults to verified cURL fields: id,caption,media_type,media_url,permalink,timestamp.
+    """
+    workspace = get_or_create_workspace(db, current_user)
+    account = get_connected_account(db, workspace.id)
+    if not account or not account.is_connected:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No connected Instagram account found for this workspace."
+        )
+
+    if account.is_sandbox:
+        return {
+            "data": [
+                {
+                    "id": f"sandbox_media_{account.ig_user_id}_1",
+                    "caption": "Sandbox Reel: 3 Hook Mistakes That Kill Your Retention",
+                    "media_type": "VIDEO",
+                    "media_url": "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4",
+                    "permalink": f"https://www.instagram.com/reel/C_demo_{account.ig_user_id}_1/",
+                    "timestamp": "2026-10-12T14:30:00+0000"
+                },
+                {
+                    "id": f"sandbox_media_{account.ig_user_id}_2",
+                    "caption": "Sandbox Reel: The 140 WPM Sweet Spot for Spoken Pacing",
+                    "media_type": "VIDEO",
+                    "media_url": "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerEscapes.mp4",
+                    "permalink": f"https://www.instagram.com/reel/C_demo_{account.ig_user_id}_2/",
+                    "timestamp": "2026-10-10T18:15:00+0000"
+                }
+            ],
+            "is_sandbox": True
+        }
+
+    from app.security import decrypt_token
+    from app.services.instagram_service import fetch_instagram_media_list, MetaTokenExpiredError
+
+    plain_token = decrypt_token(account.encrypted_access_token)
+    if not plain_token:
+        account.is_connected = False
+        db.commit()
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Stored Instagram access token corrupted or missing.")
+
+    try:
+        items = fetch_instagram_media_list(
+            access_token=plain_token,
+            user_id=account.ig_user_id,
+            fields=fields,
+            limit=limit
+        )
+        return {"data": items, "is_sandbox": False, "count": len(items)}
+    except MetaTokenExpiredError as e:
+        account.is_connected = False
+        db.commit()
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Meta Graph API error: {str(e)}")
+
 @router.get("/oauth-url", response_model=InstagramOAuthURLResponse)
 def get_oauth_url(
     current_user: User = Depends(get_current_user),

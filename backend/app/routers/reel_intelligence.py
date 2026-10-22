@@ -303,7 +303,7 @@ def list_connected_account_reels(
         }
 
     if not account.is_sandbox:
-        from app.services.instagram_service import fetch_instagram_media_list
+        from app.services.instagram_service import fetch_instagram_media_list, MetaTokenExpiredError
         from app.security import decrypt_token
         plain_token = decrypt_token(account.encrypted_access_token)
         if not plain_token:
@@ -312,22 +312,35 @@ def list_connected_account_reels(
                 detail="Instagram access token is missing or corrupted. Please reconnect."
             )
         try:
-            items = fetch_instagram_media_list(plain_token, limit=25)
+            from app.models.reel_intelligence import ReelMetricSnapshot, ReelAnalysisJob
+            items = fetch_instagram_media_list(plain_token, user_id=account.ig_user_id, limit=25)
             live_reels = []
             for item in items:
                 m_type = item.get("media_type")
                 p_type = item.get("media_product_type")
+                m_id = item.get("id")
+                # Look up actual verified snapshot if previously synchronized
+                recent_snapshot = db.query(ReelMetricSnapshot).filter(
+                    ReelMetricSnapshot.workspace_id == workspace.id
+                ).join(ReelAnalysisJob, ReelAnalysisJob.id == ReelMetricSnapshot.job_id).filter(
+                    ReelAnalysisJob.source_media_id == m_id
+                ).order_by(ReelMetricSnapshot.snapshot_timestamp.desc()).first()
+
+                actual_views = recent_snapshot.views_count if recent_snapshot else None
+
                 if m_type == "VIDEO" or p_type == "REELS":
                     live_reels.append({
-                        "media_id": item.get("id"),
+                        "media_id": m_id,
                         "title": (item.get("caption") or "Instagram Reel").split("\n")[0][:60],
                         "caption": item.get("caption") or "",
                         "thumbnail_url": item.get("thumbnail_url") or item.get("media_url") or "",
                         "media_url": item.get("media_url") or "",
-                        "views": int(item.get("like_count", 0) * 10),
-                        "likes": int(item.get("like_count", 0)),
-                        "comments": int(item.get("comments_count", 0)),
-                        "published_at": item.get("timestamp") or ""
+                        "permalink": item.get("permalink") or "",
+                        "views": actual_views if actual_views is not None else 0,
+                        "likes": int(item.get("like_count", 0)) if item.get("like_count") is not None else 0,
+                        "comments": int(item.get("comments_count", 0)) if item.get("comments_count") is not None else 0,
+                        "published_at": item.get("timestamp") or "",
+                        "has_synced_insights": actual_views is not None
                     })
             return {
                 "has_connected_account": True,
@@ -335,6 +348,13 @@ def list_connected_account_reels(
                 "is_sandbox": False,
                 "reels": live_reels
             }
+        except MetaTokenExpiredError as e:
+            account.is_connected = False
+            db.commit()
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=f"Instagram access token expired or revoked: {str(e)}"
+            )
         except Exception as e:
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,

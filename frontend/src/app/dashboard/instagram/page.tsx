@@ -254,6 +254,30 @@ function InstagramConnectionContent() {
         </div>
       )}
 
+      {/* Token Expiration / Revocation Alert Banner */}
+      {isConnected && isTokenExpired && (
+        <div className="rounded-xl bg-amber-50 border border-amber-300 p-4 text-xs font-medium text-amber-900 flex flex-col sm:flex-row sm:items-center justify-between gap-3 shadow-sm">
+          <div className="flex items-start sm:items-center gap-2.5">
+            <AlertTriangle className="h-5 w-5 text-amber-600 flex-shrink-0 mt-0.5 sm:mt-0" />
+            <div>
+              <p className="font-semibold text-amber-950 text-sm">Meta Instagram Access Token Invalidated or Expired</p>
+              <p className="text-amber-800 text-xs mt-0.5">
+                The access token session has ended or was invalidated by Meta (e.g. security session reset, password change, or 60-day expiry). Reauthorize to restore live media retrieval and insights sync.
+              </p>
+            </div>
+          </div>
+          <Button
+            variant="primary"
+            size="sm"
+            onClick={handleStartMetaOAuth}
+            className="text-xs bg-amber-600 hover:bg-amber-700 text-white whitespace-nowrap self-start sm:self-auto shadow-sm"
+          >
+            <Instagram className="h-3.5 w-3.5 mr-1.5" />
+            Reauthorize Instagram
+          </Button>
+        </div>
+      )}
+
       {/* Connected Account Overview */}
       {isConnected && account ? (
         <div className="space-y-6">
@@ -386,6 +410,16 @@ function InstagramConnectionContent() {
                 >
                   <RefreshCw className={`h-3.5 w-3.5 mr-1.5 ${refreshing ? "animate-spin" : ""}`} />
                   Refresh 60-Day Token
+                </Button>
+
+                <Button
+                  variant={isTokenExpired ? "primary" : "secondary"}
+                  size="sm"
+                  onClick={handleStartMetaOAuth}
+                  className={`text-xs ${isTokenExpired ? "bg-amber-600 hover:bg-amber-700 text-white" : "text-slate-700 hover:bg-slate-100"}`}
+                >
+                  <Instagram className="h-3.5 w-3.5 mr-1.5" />
+                  {isTokenExpired ? "Reauthorize Account Now" : "Reauthorize / Switch Account"}
                 </Button>
               </div>
 

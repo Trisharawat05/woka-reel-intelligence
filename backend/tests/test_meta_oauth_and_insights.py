@@ -283,6 +283,71 @@ def test_connect_account_rejects_invalid_csrf_state(client, auth_headers):
     assert "CSRF protection failed" in resp.json()["detail"]
 
 
+def test_reauthorization_updates_account_in_place_without_duplicates(client, auth_headers, test_creator_user, db_session):
+    """
+    Verifies Phase 11 requirement:
+    When an already-connected or expired account is reauthorized via OAuth,
+    the system must securely update the existing InstagramAccount record in place,
+    refresh the token and expiration, and never create duplicate account records.
+    """
+    user, ws = test_creator_user
+    initial_account = db_session.query(InstagramAccount).filter(InstagramAccount.workspace_id == ws.id).first()
+    original_id = initial_account.id
+
+    # Simulate token expiration / invalidation
+    initial_account.token_expires_at = datetime.now(timezone.utc) - timedelta(days=1)
+    initial_account.encrypted_access_token = encrypt_token("old_invalidated_token")
+    initial_account.is_connected = False
+    db_session.commit()
+
+    accounts_before_count = db_session.query(InstagramAccount).filter(InstagramAccount.workspace_id == ws.id).count()
+    assert accounts_before_count == 1
+
+    # Reauthorize via /api/v1/instagram/connect
+    state = generate_oauth_state(ws.id)
+    new_token_payload = {
+        "access_token": "reauthorized_long_lived_token_new_2026",
+        "user_id": "17841458643277126",
+        "expires_in": 5184000,
+        "permissions": ["instagram_business_basic", "instagram_business_manage_insights"]
+    }
+    new_profile_payload = {
+        "id": "17841458643277126",
+        "username": "reauthorized_creator_pro",
+        "name": "Reauthorized Creator",
+        "profile_picture_url": "https://example.com/new_pic.jpg"
+    }
+
+    with patch("app.services.instagram_service.exchange_code_for_tokens", return_value=new_token_payload), \
+         patch("app.services.instagram_service.fetch_instagram_user_profile", return_value=new_profile_payload):
+        
+        resp = client.post(
+            "/api/v1/instagram/connect",
+            json={"code": "meta_auth_code_reauthorized", "state": state},
+            headers=auth_headers
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["username"] == "reauthorized_creator_pro"
+        assert data["is_connected"] is True
+
+        # Database verification: exact same record updated, no duplicates
+        accounts_after = db_session.query(InstagramAccount).filter(InstagramAccount.workspace_id == ws.id).all()
+        assert len(accounts_after) == 1
+        updated_account = accounts_after[0]
+        assert updated_account.id == original_id
+        assert updated_account.username == "reauthorized_creator_pro"
+        assert updated_account.ig_user_id == "17841458643277126"
+        assert updated_account.is_connected is True
+        assert updated_account.is_sandbox is False
+        assert updated_account.is_token_expired is False
+
+        # Token was re-encrypted with AES-256-GCM
+        decrypted = decrypt_token(updated_account.encrypted_access_token)
+        assert decrypted == "reauthorized_long_lived_token_new_2026"
+
+
+
 def test_instagram_status_endpoint(client, auth_headers, test_creator_user):
     user, ws = test_creator_user
     resp = client.get("/api/v1/instagram/status", headers=auth_headers)

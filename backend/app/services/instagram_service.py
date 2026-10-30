@@ -2,6 +2,7 @@ import base64
 import hashlib
 import hmac
 import json
+import re
 import urllib.parse
 import uuid
 import time
@@ -32,16 +33,29 @@ META_OAUTH_SCOPES = [
     "pages_read_engagement"
 ]
 
+# Verified Instagram Graph API Media fields from source of truth
+VERIFIED_INSTAGRAM_MEDIA_FIELDS = "id,caption,media_type,media_url,permalink,timestamp"
+
 
 # ==============================================================================
-# Meta API Custom Exceptions
+# Meta API Custom Exceptions & Sanitization
 # ==============================================================================
+
+def sanitize_meta_error_message(msg: str) -> str:
+    """Removes any access tokens or client secrets that might appear in URLs or error responses."""
+    if not msg:
+        return ""
+    sanitized = re.sub(r'access_token=[a-zA-Z0-9_\-]+', 'access_token=[REDACTED]', str(msg))
+    sanitized = re.sub(r'client_secret=[a-zA-Z0-9_\-]+', 'client_secret=[REDACTED]', sanitized)
+    return sanitized
+
 
 class MetaAPIError(Exception):
-    """Base exception for Meta Graph API errors."""
+    """Base exception for Meta Graph API errors with secret sanitization."""
     def __init__(self, message: str, code: Optional[int] = None, subcode: Optional[int] = None):
-        super().__init__(message)
-        self.message = message
+        clean_msg = sanitize_meta_error_message(message)
+        super().__init__(clean_msg)
+        self.message = clean_msg
         self.code = code
         self.subcode = subcode
 
@@ -202,7 +216,7 @@ def get_oauth_authorization_url(workspace_id: str, flow: str = "instagram_busine
 
     if flow == "instagram_business":
         oauth_url = (
-            f"https://www.instagram.com/oauth/authorize?"
+            f"{settings.INSTAGRAM_AUTH_HOST}/oauth/authorize?"
             f"enable_fb_login=0"
             f"&force_authentication=1"
             f"&client_id={settings.META_APP_ID}"
@@ -237,7 +251,7 @@ def exchange_code_for_tokens(code: str, redirect_uri: Optional[str] = None) -> d
     target_redirect_uri = redirect_uri or settings.META_REDIRECT_URI
 
     # 1. Exchange authorization code for short-lived access token
-    token_url = "https://api.instagram.com/oauth/access_token"
+    token_url = f"{settings.INSTAGRAM_LOGIN_HOST}/oauth/access_token"
     token_payload = {
         "client_id": settings.META_APP_ID,
         "client_secret": settings.META_APP_SECRET,
@@ -264,7 +278,7 @@ def exchange_code_for_tokens(code: str, redirect_uri: Optional[str] = None) -> d
                 raise MetaAPIError("No access token returned in Meta response")
 
             # 2. Exchange short-lived token for long-lived (60-day) token
-            long_lived_url = "https://graph.instagram.com/access_token"
+            long_lived_url = f"{settings.INSTAGRAM_GRAPH_HOST}/access_token"
             long_lived_params = {
                 "grant_type": "ig_exchange_token",
                 "client_secret": settings.META_APP_SECRET,
@@ -291,7 +305,7 @@ def exchange_code_for_tokens(code: str, redirect_uri: Optional[str] = None) -> d
 
 def refresh_long_lived_token(token: str) -> dict:
     """Refreshes a 60-day long-lived token via graph.instagram.com/refresh_access_token."""
-    refresh_url = "https://graph.instagram.com/refresh_access_token"
+    refresh_url = f"{settings.INSTAGRAM_GRAPH_HOST}/refresh_access_token"
     params = {
         "grant_type": "ig_refresh_token",
         "access_token": token
@@ -317,7 +331,7 @@ def refresh_long_lived_token(token: str) -> dict:
 
 def fetch_instagram_user_profile(access_token: str) -> dict:
     """Fetches account identity and profile metadata via Graph API."""
-    me_url = f"https://graph.instagram.com/{settings.META_API_VERSION}/me"
+    me_url = f"{settings.INSTAGRAM_GRAPH_HOST}/{settings.META_API_VERSION}/me"
     params = {
         "fields": "id,username,name,profile_picture_url,account_type",
         "access_token": access_token
@@ -345,25 +359,25 @@ def fetch_instagram_media_list(
     access_token: str,
     user_id: Optional[str] = None,
     fields: Optional[str] = None,
-    limit: int = 25,
-    max_pages: int = 2
+    limit: int = 10,
+    max_pages: int = 1
 ) -> list:
     """
-    Fetches media items (Reels/Videos) for the authenticated account with pagination support.
-    Supports querying specific user_id (e.g. 17841458643277126 from cURL source of truth) or default 'me'.
-    Preserves verified cURL fields: id, caption, media_type, media_url, permalink, timestamp.
-    Gracefully falls back to core verified fields if extended fields are unsupported (Meta code 100).
+    Fetches media items (Reels/Videos/Images) for the authorized Instagram user ID.
+    Defaults to verified cURL fields: id,caption,media_type,media_url,permalink,timestamp.
+    Enforces media limit of 10 without duplicate query parameters.
+    Gracefully handles missing optional fields, token expiration (190), permission issues, and rate limits.
     """
     target = user_id or "me"
-    media_url = f"https://graph.instagram.com/{settings.META_API_VERSION}/{target}/media"
+    media_url = f"{settings.INSTAGRAM_GRAPH_HOST}/{settings.META_API_VERSION}/{target}/media"
     
-    verified_curl_fields = "id,caption,media_type,media_url,permalink,timestamp"
-    default_fields = f"{verified_curl_fields},thumbnail_url,media_product_type,like_count,comments_count"
-    query_fields = fields or default_fields
+    extended_fields = f"{VERIFIED_INSTAGRAM_MEDIA_FIELDS},thumbnail_url,media_product_type,like_count,comments_count"
+    query_fields = fields or extended_fields
 
+    # Parameter dictionary guarantees limit is passed exactly once with no duplicates
     params = {
         "fields": query_fields,
-        "limit": min(limit, 50),
+        "limit": min(max(limit, 1), 50),
         "access_token": access_token
     }
     all_items = []
@@ -376,28 +390,78 @@ def fetch_instagram_media_list(
             resp = _request_with_retry("GET", current_url, params=current_params)
             if resp.status_code != 200:
                 err_data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
-                err_msg = err_data.get("error", {}).get("message") or resp.text
-                err_code = err_data.get("error", {}).get("code")
+                err_obj = err_data.get("error", {})
+                err_msg = err_obj.get("message") or resp.text
+                err_code = err_obj.get("code")
+                err_subcode = err_obj.get("error_subcode")
+
                 if err_code in [190, 102]:
-                    raise MetaTokenExpiredError(f"Access token expired or revoked: {err_msg}", code=err_code)
-                if err_code in [4, 17, 32]:
-                    raise MetaRateLimitError(f"Rate limited by Meta: {err_msg}", code=err_code)
-                if err_code == 100 and current_params and current_params.get("fields") != verified_curl_fields:
-                    # Extended fields rejected; fallback to exact verified cURL fields
-                    current_params["fields"] = verified_curl_fields
-                    continue
-                raise MetaAPIError(f"Failed to fetch media list: {err_msg}", code=err_code)
+                    raise MetaTokenExpiredError(
+                        f"Instagram access token expired or revoked (Meta error {err_code}). Reauthorization required: {err_msg}",
+                        code=err_code,
+                        subcode=err_subcode
+                    )
+                if err_code in [10, 200] or "permission" in err_msg.lower():
+                    raise MetaPermissionError(
+                        f"Permission denied accessing Instagram media (Meta error {err_code}): {err_msg}",
+                        code=err_code,
+                        subcode=err_subcode
+                    )
+                if err_code in [4, 17, 32, 613] or "rate limit" in err_msg.lower():
+                    raise MetaRateLimitError(
+                        f"Meta Graph API rate limit exceeded (Meta error {err_code}): {err_msg}",
+                        code=err_code,
+                        subcode=err_subcode
+                    )
+                if err_code == 100:
+                    if current_params and current_params.get("fields") != VERIFIED_INSTAGRAM_MEDIA_FIELDS:
+                        # Optional/extended fields rejected; gracefully fall back to exact verified core fields
+                        current_params["fields"] = VERIFIED_INSTAGRAM_MEDIA_FIELDS
+                        continue
+                    raise MetaAPIError(
+                        f"Meta Graph API field or parameter error (Meta error 100): {err_msg}",
+                        code=err_code,
+                        subcode=err_subcode
+                    )
+
+                raise MetaAPIError(
+                    f"Failed to fetch Instagram media list (status {resp.status_code}, error {err_code}): {err_msg}",
+                    code=err_code,
+                    subcode=err_subcode
+                )
 
             resp_json = resp.json()
             items = resp_json.get("data", [])
-            all_items.extend(items)
+
+            # Normalize items: ensure optional fields like caption or media_url are safely defaulted
+            for item in items:
+                normalized = {
+                    "id": str(item.get("id", "")),
+                    "caption": item.get("caption") or "",
+                    "media_type": str(item.get("media_type", "UNKNOWN")),
+                    "media_url": item.get("media_url") or "",
+                    "permalink": item.get("permalink") or "",
+                    "timestamp": item.get("timestamp") or ""
+                }
+                if "thumbnail_url" in item:
+                    normalized["thumbnail_url"] = item.get("thumbnail_url")
+                if "media_product_type" in item:
+                    normalized["media_product_type"] = item.get("media_product_type")
+                if "like_count" in item:
+                    normalized["like_count"] = item.get("like_count")
+                if "comments_count" in item:
+                    normalized["comments_count"] = item.get("comments_count")
+
+                all_items.append(normalized)
+
             page += 1
             paging = resp_json.get("paging", {})
             current_url = paging.get("next")
+            # Next URL contains all parameters; set current_params to None to avoid parameter duplication
             current_params = None
 
         return all_items
-    except (MetaTokenExpiredError, MetaRateLimitError, MetaAPIError):
+    except (MetaTokenExpiredError, MetaPermissionError, MetaRateLimitError, MetaAPIError):
         raise
     except Exception as exc:
         raise MetaAPIError(f"Network error fetching media list: {str(exc)}")
@@ -409,7 +473,7 @@ def fetch_media_insights(access_token: str, media_id: str) -> dict:
     Supported metrics for Reels: views, reach, saved, shares, total_interactions.
     Gracefully handles metric-specific errors (code 100) and unsupported media objects.
     """
-    insights_url = f"https://graph.instagram.com/{settings.META_API_VERSION}/{media_id}/insights"
+    insights_url = f"{settings.INSTAGRAM_GRAPH_HOST}/{settings.META_API_VERSION}/{media_id}/insights"
     # Query modern unified 'views' metric, falling back to reach if code 100 is returned
     metric_queries = [
         "views,reach,saved,shares,total_interactions",

@@ -98,13 +98,19 @@ def get_instagram_media(
         }
 
     from app.security import decrypt_token
-    from app.services.instagram_service import fetch_instagram_media_list, MetaTokenExpiredError
+    from app.services.instagram_service import (
+        fetch_instagram_media_list,
+        MetaTokenExpiredError,
+        MetaPermissionError,
+        MetaRateLimitError,
+        MetaAPIError
+    )
 
     plain_token = decrypt_token(account.encrypted_access_token)
     if not plain_token:
         account.is_connected = False
         db.commit()
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Stored Instagram access token corrupted or missing.")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Stored Instagram access token corrupted or missing. Reauthorization required.")
 
     try:
         items = fetch_instagram_media_list(
@@ -118,8 +124,14 @@ def get_instagram_media(
         account.is_connected = False
         db.commit()
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(e))
-    except Exception as e:
+    except MetaPermissionError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+    except MetaRateLimitError as e:
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
+    except MetaAPIError as e:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Meta Graph API error: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Unexpected error querying Meta Graph API: {str(e)}")
 
 @router.get("/oauth-url", response_model=InstagramOAuthURLResponse)
 def get_oauth_url(

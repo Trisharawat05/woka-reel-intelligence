@@ -31,12 +31,15 @@ class Settings(BaseSettings):
         description="Redis connection URL for shared caching and background processing"
     )
 
-    # Official Meta / Instagram App Credentials
+    # Official Meta / Instagram App Credentials & Endpoints
     META_APP_ID: str = Field(default="mock_meta_app_id_12345", description="Meta Developer App ID")
     META_APP_SECRET: str = Field(default="mock_meta_app_secret_67890", description="Meta Developer App Secret")
     META_VERIFY_TOKEN: str = Field(default="woka_meta_webhook_verify_token_2026", description="Webhook handshake token")
     META_REDIRECT_URI: str = Field(default="http://localhost:3000/dashboard/instagram/callback", description="OAuth callback URI")
     META_API_VERSION: str = Field(default="v21.0", description="Meta Graph API version (e.g. v21.0)")
+    INSTAGRAM_GRAPH_HOST: str = Field(default="https://graph.instagram.com", description="Instagram Graph API host")
+    INSTAGRAM_LOGIN_HOST: str = Field(default="https://api.instagram.com", description="Instagram OAuth API host")
+    INSTAGRAM_AUTH_HOST: str = Field(default="https://www.instagram.com", description="Instagram Web Authorize host")
     FRONTEND_URL: str = Field(default="http://localhost:3000", description="Frontend application URL")
 
     # CORS & Trusted Hosts

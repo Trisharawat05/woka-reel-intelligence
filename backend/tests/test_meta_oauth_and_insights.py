@@ -942,3 +942,131 @@ def test_list_connected_account_reels_preserves_permalink_and_no_fabricated_view
         assert r["views"] == 0
         assert r["has_synced_insights"] is False
 
+
+def test_fetch_instagram_media_list_permission_error():
+    """Verifies that Meta permission denial (code 10/200) raises MetaPermissionError."""
+    err_resp = MagicMock()
+    err_resp.status_code = 400
+    err_resp.headers = {"content-type": "application/json"}
+    err_resp.json.return_value = {
+        "error": {
+            "message": "(#10) Application does not have permission for this action",
+            "type": "OAuthException",
+            "code": 10
+        }
+    }
+
+    with patch("app.services.instagram_service._request_with_retry", return_value=err_resp):
+        with pytest.raises(MetaPermissionError) as exc_info:
+            fetch_instagram_media_list(access_token="mock_no_perm_token")
+        assert "Permission denied" in str(exc_info.value)
+
+
+def test_fetch_instagram_media_list_rate_limit_error():
+    """Verifies that Meta rate limiting (code 4/17/32/613) raises MetaRateLimitError."""
+    err_resp = MagicMock()
+    err_resp.status_code = 400
+    err_resp.headers = {"content-type": "application/json"}
+    err_resp.json.return_value = {
+        "error": {
+            "message": "(#4) Application request limit reached",
+            "type": "OAuthException",
+            "code": 4
+        }
+    }
+
+    with patch("app.services.instagram_service._request_with_retry", return_value=err_resp):
+        with pytest.raises(MetaRateLimitError) as exc_info:
+            fetch_instagram_media_list(access_token="mock_rate_limit_token")
+        assert "rate limit exceeded" in str(exc_info.value).lower()
+
+
+def test_fetch_instagram_media_list_missing_optional_fields_normalization():
+    """Verifies that media items missing optional fields (caption, media_url, etc.) are safely normalized."""
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.headers = {"content-type": "application/json"}
+    mock_resp.json.return_value = {
+        "data": [
+            {
+                "id": "item_no_optional_fields",
+                "media_type": "IMAGE"
+                # caption, media_url, permalink, timestamp are omitted by Meta
+            }
+        ]
+    }
+
+    with patch("app.services.instagram_service._request_with_retry", return_value=mock_resp):
+        items = fetch_instagram_media_list(access_token="valid_token")
+        assert len(items) == 1
+        item = items[0]
+        assert item["id"] == "item_no_optional_fields"
+        assert item["caption"] == ""
+        assert item["media_url"] == ""
+        assert item["permalink"] == ""
+        assert item["timestamp"] == ""
+        assert item["media_type"] == "IMAGE"
+
+
+def test_error_message_token_sanitization():
+    """Verifies that error messages containing access tokens or secrets are stripped."""
+    err_msg = "Error accessing https://graph.instagram.com/me?access_token=EAAB1234567890abcdef&client_secret=SECRET123"
+    sanitized = MetaAPIError(err_msg)
+    assert "access_token=[REDACTED]" in str(sanitized)
+    assert "client_secret=[REDACTED]" in str(sanitized)
+    assert "EAAB1234567890abcdef" not in str(sanitized)
+    assert "SECRET123" not in str(sanitized)
+
+
+def test_get_instagram_media_endpoint_permission_error_returns_403(client, auth_headers, test_creator_user, db_session):
+    """Verifies GET /api/v1/instagram/media returns 403 when Meta denies permissions."""
+    user, ws = test_creator_user
+    acc = db_session.query(InstagramAccount).filter(InstagramAccount.workspace_id == ws.id).first()
+    acc.is_sandbox = False
+    acc.encrypted_access_token = encrypt_token("mock_token")
+    acc.ig_user_id = "17841458643277126"
+    db_session.commit()
+
+    err_resp = MagicMock()
+    err_resp.status_code = 400
+    err_resp.headers = {"content-type": "application/json"}
+    err_resp.json.return_value = {
+        "error": {
+            "message": "(#10) Missing instagram_business_basic scope",
+            "type": "OAuthException",
+            "code": 10
+        }
+    }
+
+    with patch("app.services.instagram_service._request_with_retry", return_value=err_resp):
+        resp = client.get("/api/v1/instagram/media", headers=auth_headers)
+        assert resp.status_code == 403
+        assert "Permission denied" in resp.json()["detail"]
+
+
+def test_get_instagram_media_endpoint_rate_limit_returns_429(client, auth_headers, test_creator_user, db_session):
+    """Verifies GET /api/v1/instagram/media returns 429 when Meta rate limits are reached."""
+    user, ws = test_creator_user
+    acc = db_session.query(InstagramAccount).filter(InstagramAccount.workspace_id == ws.id).first()
+    acc.is_sandbox = False
+    acc.encrypted_access_token = encrypt_token("mock_token")
+    acc.ig_user_id = "17841458643277126"
+    db_session.commit()
+
+    err_resp = MagicMock()
+    err_resp.status_code = 400
+    err_resp.headers = {"content-type": "application/json"}
+    err_resp.json.return_value = {
+        "error": {
+            "message": "(#17) User request limit reached",
+            "type": "OAuthException",
+            "code": 17
+        }
+    }
+
+    with patch("app.services.instagram_service._request_with_retry", return_value=err_resp):
+        resp = client.get("/api/v1/instagram/media", headers=auth_headers)
+        assert resp.status_code == 429
+        assert "rate limit exceeded" in resp.json()["detail"].lower()
+
+

@@ -17,9 +17,11 @@ frontend/.env.local
 frontend/.env.production
 frontend/.env.development
 
-# Next.js Build Output
+# Next.js & Vercel Build Output
 .next/
 frontend/.next/
+.vercel/
+frontend/.vercel/
 out/
 build/
 dist/

@@ -11,6 +11,9 @@ from typing import Optional, List, Dict, Any
 from sqlalchemy.orm import Session
 from fastapi import HTTPException, status
 import httpx
+import logging
+
+logger = logging.getLogger(__name__)
 
 from app.config import settings
 from app.models.instagram import InstagramAccount
@@ -252,9 +255,17 @@ def exchange_code_for_tokens(code: str, redirect_uri: Optional[str] = None) -> d
     """
     Exchanges OAuth authorization code for a short-lived token, then converts to 60-day long-lived token.
     Uses official Meta Instagram Graph API endpoints.
-    Enforces identical redirect_uri as the authorization request.
+    Enforces the single canonical server redirect_uri to guarantee exact match with authorization request.
+    No frontend-supplied redirect_uri can override the canonical server setting.
     """
-    target_redirect_uri = (redirect_uri or settings.effective_instagram_redirect_uri).strip().rstrip('/')
+    canonical_redirect_uri = settings.effective_instagram_redirect_uri
+
+    if redirect_uri and redirect_uri.strip().rstrip('/') != canonical_redirect_uri:
+        logger.warning(
+            "Client supplied redirect_uri '%s' differing from canonical '%s'; enforcing canonical server redirect_uri.",
+            redirect_uri,
+            canonical_redirect_uri
+        )
 
     # 1. Exchange authorization code for short-lived access token
     token_url = f"{settings.INSTAGRAM_LOGIN_HOST}/oauth/access_token"
@@ -262,7 +273,7 @@ def exchange_code_for_tokens(code: str, redirect_uri: Optional[str] = None) -> d
         "client_id": settings.META_APP_ID,
         "client_secret": settings.META_APP_SECRET,
         "grant_type": "authorization_code",
-        "redirect_uri": target_redirect_uri,
+        "redirect_uri": canonical_redirect_uri,
         "code": code
     }
 
@@ -546,16 +557,29 @@ def connect_or_update_account_from_oauth(
             detail="Invalid or expired OAuth state parameter (CSRF protection failed)."
         )
 
-    # In sandbox/mock development or automated test mode without live Meta credentials
-    if code.startswith(("mock_", "auth_code_", "test_")) or (settings.META_APP_ID.startswith("mock_") and code.startswith("mock_")):
+    is_production = settings.ENVIRONMENT.lower() == "production"
+    is_synthetic_code = code.startswith(("mock_", "auth_code_", "test_"))
+
+    # Strictly reject mock authorization codes in production
+    if is_production and is_synthetic_code:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid authorization code: mock or synthetic authorization codes are strictly forbidden in production."
+        )
+
+    # Permit mock OAuth ONLY through explicit test-mode configuration
+    mock_mode_active = (not is_production) and (
+        settings.ENABLE_MOCK_OAUTH or settings.ENVIRONMENT.lower() in ("test", "testing")
+    )
+
+    if mock_mode_active and is_synthetic_code:
         return toggle_sandbox_account(db, workspace_id, enabled=True, username="creator_woka_live")
 
     # Live Meta code exchange
     try:
         token_data = exchange_code_for_tokens(code, redirect_uri=redirect_uri)
     except MetaAPIError as e:
-        if settings.META_APP_ID.startswith("mock_") or code.startswith(("mock_", "auth_code_", "test_")):
-            return toggle_sandbox_account(db, workspace_id, enabled=True, username="creator_woka_live")
+        # Invalid or fabricated authorization codes must NEVER create a connected account
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Meta OAuth authorization code exchange failed: {e.message}"

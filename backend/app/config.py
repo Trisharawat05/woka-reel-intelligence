@@ -1,7 +1,71 @@
 import os
+import urllib.parse
 from typing import List, Any
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field, model_validator, field_validator
+
+def validate_and_normalize_redirect_uri(raw_uri: str, api_v1_str: str = "/api/v1") -> str:
+    """
+    Validates and normalizes an OAuth callback URI.
+    Enforces:
+    - Non-empty string
+    - Well-formed HTTP/HTTPS URL
+    - HTTPS required for non-localhost/non-loopback domains
+    - Rejects credentials (user:pass@host)
+    - Rejects fragments (#...)
+    - Rejects query parameters (?...)
+    - Path must end with {api_v1_str}/instagram/callback
+    Returns strictly normalized canonical URL with no trailing slash.
+    """
+    if not raw_uri or not isinstance(raw_uri, str):
+        raise ValueError("CRITICAL CONFIGURATION ERROR: OAuth callback URI cannot be empty.")
+
+    clean_uri = raw_uri.strip().rstrip("/")
+    parsed = urllib.parse.urlparse(clean_uri)
+
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(
+            f"CRITICAL CONFIGURATION ERROR: Invalid OAuth callback URI scheme '{parsed.scheme}'. "
+            "Must be 'http' (localhost only) or 'https'."
+        )
+
+    if not parsed.netloc or not parsed.hostname:
+        raise ValueError(
+            f"CRITICAL CONFIGURATION ERROR: Malformed OAuth callback URI '{raw_uri}'. Missing valid host."
+        )
+
+    if parsed.username or parsed.password:
+        raise ValueError(
+            "CRITICAL SECURITY VIOLATION: OAuth callback URI must not contain embedded user credentials."
+        )
+
+    if parsed.fragment:
+        raise ValueError(
+            "CRITICAL SECURITY VIOLATION: OAuth callback URI must not contain URL fragments (#)."
+        )
+
+    if parsed.query:
+        raise ValueError(
+            "CRITICAL SECURITY VIOLATION: OAuth callback URI must not contain query parameters (?)."
+        )
+
+    hostname_lower = (parsed.hostname or "").lower()
+    is_local = hostname_lower in ("localhost", "127.0.0.1", "testserver")
+    if not is_local and parsed.scheme != "https":
+        raise ValueError(
+            f"CRITICAL SECURITY VIOLATION: Public OAuth callback domain '{parsed.hostname}' must use HTTPS."
+        )
+
+    expected_suffix = f"{api_v1_str.rstrip('/')}/instagram/callback"
+    normalized_path = parsed.path.rstrip("/")
+    if not normalized_path.endswith(expected_suffix):
+        raise ValueError(
+            f"CRITICAL CONFIGURATION ERROR: OAuth callback URI '{clean_uri}' does not point to the "
+            f"FastAPI backend callback endpoint (must end with '{expected_suffix}')."
+        )
+
+    return f"{parsed.scheme}://{parsed.netloc}{normalized_path}"
+
 
 class Settings(BaseSettings):
     PROJECT_NAME: str = "Woka API"
@@ -61,6 +125,12 @@ class Settings(BaseSettings):
         description="Allowed host headers for TrustedHostMiddleware"
     )
 
+    # Test & Sandbox Controls
+    ENABLE_MOCK_OAUTH: bool = Field(
+        default=False,
+        description="Explicit test-mode setting allowing mock/synthetic OAuth authorization codes. Strictly forbidden in production."
+    )
+
     # Optional AI Provider (if empty, Woka's intelligent local template & NLP heuristic engine is used)
     OPENAI_API_KEY: str = Field(default="", description="Optional OpenAI API Key")
 
@@ -116,19 +186,23 @@ class Settings(BaseSettings):
     def effective_instagram_redirect_uri(self) -> str:
         """
         Single canonical source of truth for the Meta Instagram OAuth callback URI.
-        Enforces:
-        - Exact scheme and host from BACKEND_PUBLIC_URL or normalized META_REDIRECT_URI
-        - No accidental trailing slashes
-        - Exact canonical callback path: {API_V1_STR}/instagram/callback
+        Requires BACKEND_PUBLIC_URL or an explicitly configured META_REDIRECT_URI.
+        Never silently falls back to FRONTEND_URL.
+        Validates URL structure, schemes, host, credentials, fragments, query strings, and path.
         """
+        raw_uri = ""
         if self.BACKEND_PUBLIC_URL:
             base = self.BACKEND_PUBLIC_URL.strip().rstrip("/")
-            return f"{base}{self.API_V1_STR}/instagram/callback"
-        if self.META_REDIRECT_URI:
-            clean = self.META_REDIRECT_URI.strip().rstrip("/")
-            return clean
-        base = self.FRONTEND_URL.strip().rstrip("/")
-        return f"{base}{self.API_V1_STR}/instagram/callback"
+            raw_uri = f"{base}{self.API_V1_STR}/instagram/callback"
+        elif self.META_REDIRECT_URI:
+            raw_uri = self.META_REDIRECT_URI.strip().rstrip("/")
+        else:
+            raise ValueError(
+                "CRITICAL CONFIGURATION ERROR: Neither BACKEND_PUBLIC_URL nor an explicit META_REDIRECT_URI "
+                "is configured. A backend public URL or canonical OAuth callback URI is required."
+            )
+
+        return validate_and_normalize_redirect_uri(raw_uri, api_v1_str=self.API_V1_STR)
 
     @property
     def public_oauth_callback_url(self) -> str:
@@ -161,29 +235,27 @@ class Settings(BaseSettings):
         if self.BACKEND_PUBLIC_URL:
             clean_public = self.BACKEND_PUBLIC_URL.strip().rstrip('/')
             if clean_public:
-                if not clean_public.startswith("http://") and not clean_public.startswith("https://"):
+                parsed_base = urllib.parse.urlparse(clean_public)
+                if parsed_base.scheme not in ("http", "https"):
                     raise ValueError(f"CRITICAL CONFIGURATION ERROR: BACKEND_PUBLIC_URL must start with http:// or https:// (got: {clean_public})")
-                if "localhost" not in clean_public and "127.0.0.1" not in clean_public and not clean_public.startswith("https://"):
+                is_local = (parsed_base.hostname or "").lower() in ("localhost", "127.0.0.1", "testserver")
+                if not is_local and parsed_base.scheme != "https":
                     raise ValueError(f"CRITICAL CONFIGURATION ERROR: BACKEND_PUBLIC_URL must use HTTPS for public domains (got: {clean_public})")
 
                 self.BACKEND_PUBLIC_URL = clean_public
-                # Single canonical synchronization
-                self.META_REDIRECT_URI = f"{clean_public}{self.API_V1_STR}/instagram/callback"
+                # Single canonical synchronization & strict validation
+                canonical_uri = f"{clean_public}{self.API_V1_STR}/instagram/callback"
+                self.META_REDIRECT_URI = validate_and_normalize_redirect_uri(canonical_uri, api_v1_str=self.API_V1_STR)
 
                 if clean_public not in self.CORS_ORIGINS:
                     self.CORS_ORIGINS.append(clean_public)
-                from urllib.parse import urlparse
-                host = urlparse(clean_public).netloc
+                host = parsed_base.netloc
                 if host and "*" not in self.ALLOWED_HOSTS and host not in self.ALLOWED_HOSTS:
                     self.ALLOWED_HOSTS.append(host)
         else:
             if self.META_REDIRECT_URI:
                 clean_redirect = self.META_REDIRECT_URI.strip().rstrip("/")
-                if not clean_redirect.startswith("http://") and not clean_redirect.startswith("https://"):
-                    raise ValueError(f"CRITICAL CONFIGURATION ERROR: META_REDIRECT_URI must start with http:// or https:// (got: {clean_redirect})")
-                self.META_REDIRECT_URI = clean_redirect
-            else:
-                self.META_REDIRECT_URI = f"{self.FRONTEND_URL.strip().rstrip('/')}{self.API_V1_STR}/instagram/callback" 
+                self.META_REDIRECT_URI = validate_and_normalize_redirect_uri(clean_redirect, api_v1_str=self.API_V1_STR)
 
         if self.ENVIRONMENT.lower() == "production":
             default_secret = "woka-super-secret-production-grade-signing-key-32chars-min!"
@@ -198,6 +270,8 @@ class Settings(BaseSettings):
                 raise ValueError("CRITICAL CONFIGURATION ERROR: Valid META_APP_SECRET must be configured for production.")
             if not self.META_REDIRECT_URI or "localhost" in self.META_REDIRECT_URI:
                 raise ValueError("CRITICAL CONFIGURATION ERROR: Valid META_REDIRECT_URI must be configured for production.")
+            if self.ENABLE_MOCK_OAUTH:
+                raise ValueError("CRITICAL SECURITY VIOLATION: ENABLE_MOCK_OAUTH cannot be true in production environment.")
         return self
 
 settings = Settings()

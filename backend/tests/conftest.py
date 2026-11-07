@@ -22,6 +22,17 @@ engine = create_engine(
 )
 TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
+@pytest.fixture(autouse=True)
+def configure_test_environment():
+    from app.config import settings
+    orig_env = settings.ENVIRONMENT
+    orig_mock = settings.ENABLE_MOCK_OAUTH
+    settings.ENVIRONMENT = "test"
+    settings.ENABLE_MOCK_OAUTH = True
+    yield
+    settings.ENVIRONMENT = orig_env
+    settings.ENABLE_MOCK_OAUTH = orig_mock
+
 @pytest.fixture(scope="function")
 def db_session():
     Base.metadata.create_all(bind=engine)

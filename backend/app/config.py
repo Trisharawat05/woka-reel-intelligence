@@ -35,7 +35,7 @@ class Settings(BaseSettings):
     META_APP_ID: str = Field(default="mock_meta_app_id_12345", description="Meta Developer App ID")
     META_APP_SECRET: str = Field(default="mock_meta_app_secret_67890", description="Meta Developer App Secret")
     META_VERIFY_TOKEN: str = Field(default="woka_meta_webhook_verify_token_2026", description="Webhook handshake token")
-    META_REDIRECT_URI: str = Field(default="http://localhost:3000/dashboard/instagram/callback", description="OAuth callback URI")
+    META_REDIRECT_URI: str = Field(default="", description="Canonical OAuth callback URI")
     META_API_VERSION: str = Field(default="v21.0", description="Meta Graph API version (e.g. v21.0)")
     INSTAGRAM_GRAPH_HOST: str = Field(default="https://graph.instagram.com", description="Instagram Graph API host")
     INSTAGRAM_LOGIN_HOST: str = Field(default="https://api.instagram.com", description="Instagram OAuth API host")
@@ -113,10 +113,26 @@ class Settings(BaseSettings):
         return v
 
     @property
-    def public_oauth_callback_url(self) -> str:
+    def effective_instagram_redirect_uri(self) -> str:
+        """
+        Single canonical source of truth for the Meta Instagram OAuth callback URI.
+        Enforces:
+        - Exact scheme and host from BACKEND_PUBLIC_URL or normalized META_REDIRECT_URI
+        - No accidental trailing slashes
+        - Exact canonical callback path: {API_V1_STR}/instagram/callback
+        """
         if self.BACKEND_PUBLIC_URL:
-            return f"{self.BACKEND_PUBLIC_URL.strip().rstrip('/')}{self.API_V1_STR}/instagram/callback"
-        return self.META_REDIRECT_URI
+            base = self.BACKEND_PUBLIC_URL.strip().rstrip("/")
+            return f"{base}{self.API_V1_STR}/instagram/callback"
+        if self.META_REDIRECT_URI:
+            clean = self.META_REDIRECT_URI.strip().rstrip("/")
+            return clean
+        base = self.FRONTEND_URL.strip().rstrip("/")
+        return f"{base}{self.API_V1_STR}/instagram/callback"
+
+    @property
+    def public_oauth_callback_url(self) -> str:
+        return self.effective_instagram_redirect_uri
 
     @property
     def public_webhook_url(self) -> str:
@@ -136,28 +152,38 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def validate_production_security(self):
         # Auto-include FRONTEND_URL in CORS_ORIGINS to prevent cross-origin mismatches
-        if self.FRONTEND_URL and self.FRONTEND_URL not in self.CORS_ORIGINS:
-            self.CORS_ORIGINS.append(self.FRONTEND_URL)
+        if self.FRONTEND_URL:
+            self.FRONTEND_URL = self.FRONTEND_URL.strip().rstrip("/")
+            if self.FRONTEND_URL not in self.CORS_ORIGINS:
+                self.CORS_ORIGINS.append(self.FRONTEND_URL)
 
-        # Dynamic ngrok / public URL handling
+        # Dynamic ngrok / public URL handling & Callback URI Validation
         if self.BACKEND_PUBLIC_URL:
             clean_public = self.BACKEND_PUBLIC_URL.strip().rstrip('/')
             if clean_public:
+                if not clean_public.startswith("http://") and not clean_public.startswith("https://"):
+                    raise ValueError(f"CRITICAL CONFIGURATION ERROR: BACKEND_PUBLIC_URL must start with http:// or https:// (got: {clean_public})")
+                if "localhost" not in clean_public and "127.0.0.1" not in clean_public and not clean_public.startswith("https://"):
+                    raise ValueError(f"CRITICAL CONFIGURATION ERROR: BACKEND_PUBLIC_URL must use HTTPS for public domains (got: {clean_public})")
+
+                self.BACKEND_PUBLIC_URL = clean_public
+                # Single canonical synchronization
+                self.META_REDIRECT_URI = f"{clean_public}{self.API_V1_STR}/instagram/callback"
+
                 if clean_public not in self.CORS_ORIGINS:
                     self.CORS_ORIGINS.append(clean_public)
                 from urllib.parse import urlparse
                 host = urlparse(clean_public).netloc
                 if host and "*" not in self.ALLOWED_HOSTS and host not in self.ALLOWED_HOSTS:
                     self.ALLOWED_HOSTS.append(host)
-                # If META_REDIRECT_URI is not explicitly configured or points to localhost/placeholder,
-                # dynamically compute it from BACKEND_PUBLIC_URL
-                if (
-                    not self.META_REDIRECT_URI
-                    or "localhost" in self.META_REDIRECT_URI
-                    or "127.0.0.1" in self.META_REDIRECT_URI
-                    or "YOUR-NGROK-DOMAIN" in self.META_REDIRECT_URI
-                ):
-                    self.META_REDIRECT_URI = f"{clean_public}{self.API_V1_STR}/instagram/callback" 
+        else:
+            if self.META_REDIRECT_URI:
+                clean_redirect = self.META_REDIRECT_URI.strip().rstrip("/")
+                if not clean_redirect.startswith("http://") and not clean_redirect.startswith("https://"):
+                    raise ValueError(f"CRITICAL CONFIGURATION ERROR: META_REDIRECT_URI must start with http:// or https:// (got: {clean_redirect})")
+                self.META_REDIRECT_URI = clean_redirect
+            else:
+                self.META_REDIRECT_URI = f"{self.FRONTEND_URL.strip().rstrip('/')}{self.API_V1_STR}/instagram/callback" 
 
         if self.ENVIRONMENT.lower() == "production":
             default_secret = "woka-super-secret-production-grade-signing-key-32chars-min!"

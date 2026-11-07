@@ -2,7 +2,7 @@ import json
 from datetime import datetime, date, timezone, timedelta
 from app.database import SessionLocal, Base, engine
 from app.models.user import User, Workspace, WorkspaceMember
-from app.models.instagram import InstagramAccount
+from app.models.instagram import InstagramAccount, InstagramDataDeletionRequest
 from app.models.automation import Automation, AutomationLog
 from app.models.profile import CreatorProfile
 from app.models.campaign import BrandCampaign, CampaignApplication
@@ -337,6 +337,20 @@ def seed_database():
             db.flush()
             db.add(WorkspaceMember(workspace_id=admin_ws.id, user_id=admin.id, role_in_workspace="OWNER"))
             print("Seeded Admin (admin@woka.io).")
+
+        # 5. Data Deletion Request (woka_del_test123)
+        existing_del = db.query(InstagramDataDeletionRequest).filter(
+            InstagramDataDeletionRequest.confirmation_code == "woka_del_test123"
+        ).first()
+        if not existing_del:
+            db.add(InstagramDataDeletionRequest(
+                confirmation_code="woka_del_test123",
+                ig_user_id="seed_ig_user_del",
+                status="COMPLETED",
+                details="User data deletion request has been processed. Access tokens and profile associations have been purged.",
+                completed_at=datetime.now(timezone.utc)
+            ))
+            print("Seeded data deletion request woka_del_test123.")
 
         db.commit()
         print("Database seed completed successfully.")

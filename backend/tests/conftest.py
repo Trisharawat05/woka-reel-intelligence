@@ -37,6 +37,16 @@ def configure_test_environment():
 def db_session():
     Base.metadata.create_all(bind=engine)
     db = TestingSessionLocal()
+    from app.models.instagram import InstagramDataDeletionRequest
+    from datetime import datetime, timezone
+    db.add(InstagramDataDeletionRequest(
+        confirmation_code="woka_del_test123",
+        ig_user_id="test_ig_user_del",
+        status="COMPLETED",
+        details="User data deletion request has been processed. Access tokens and profile associations have been purged.",
+        completed_at=datetime.now(timezone.utc)
+    ))
+    db.commit()
     try:
         yield db
     finally:

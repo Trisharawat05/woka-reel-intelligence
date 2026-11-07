@@ -39,3 +39,15 @@ class InstagramAccount(Base):
         if exp.tzinfo is None:
             exp = exp.replace(tzinfo=timezone.utc)
         return exp < now
+
+
+class InstagramDataDeletionRequest(Base):
+    __tablename__ = "instagram_data_deletion_requests"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    confirmation_code = Column(String(64), unique=True, nullable=False, index=True)
+    ig_user_id = Column(String(64), nullable=False, index=True)
+    status = Column(String(20), nullable=False, default="PENDING")  # PENDING, COMPLETED, FAILED
+    details = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
+    completed_at = Column(DateTime(timezone=True), nullable=True)

@@ -56,12 +56,12 @@ def validate_and_normalize_redirect_uri(raw_uri: str, api_v1_str: str = "/api/v1
             f"CRITICAL SECURITY VIOLATION: Public OAuth callback domain '{parsed.hostname}' must use HTTPS."
         )
 
-    expected_suffix = f"{api_v1_str.rstrip('/')}/instagram/callback"
+    expected_path = f"{api_v1_str.rstrip('/')}/instagram/callback"
     normalized_path = parsed.path.rstrip("/")
-    if not normalized_path.endswith(expected_suffix):
+    if normalized_path != expected_path:
         raise ValueError(
-            f"CRITICAL CONFIGURATION ERROR: OAuth callback URI '{clean_uri}' does not point to the "
-            f"FastAPI backend callback endpoint (must end with '{expected_suffix}')."
+            f"CRITICAL CONFIGURATION ERROR: OAuth callback URI '{clean_uri}' path '{normalized_path}' "
+            f"does not match exact canonical backend callback path '{expected_path}'."
         )
 
     return f"{parsed.scheme}://{parsed.netloc}{normalized_path}"

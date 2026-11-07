@@ -262,9 +262,7 @@ def exchange_code_for_tokens(code: str, redirect_uri: Optional[str] = None) -> d
 
     if redirect_uri and redirect_uri.strip().rstrip('/') != canonical_redirect_uri:
         logger.warning(
-            "Client supplied redirect_uri '%s' differing from canonical '%s'; enforcing canonical server redirect_uri.",
-            redirect_uri,
-            canonical_redirect_uri
+            "OAuth callback mismatch detected in token exchange request; enforcing canonical server redirect_uri."
         )
 
     # 1. Exchange authorization code for short-lived access token

@@ -1,6 +1,6 @@
 from app.database import Base
 from app.models.user import User, Workspace, WorkspaceMember, RevokedToken, UsedOAuthNonce
-from app.models.instagram import InstagramAccount
+from app.models.instagram import InstagramAccount, InstagramDataDeletionRequest
 from app.models.automation import Automation, AutomationLog
 from app.models.analytics import CreatorAnalytics
 from app.models.profile import CreatorProfile
@@ -24,6 +24,7 @@ __all__ = [
     "RevokedToken",
     "UsedOAuthNonce",
     "InstagramAccount",
+    "InstagramDataDeletionRequest",
     "Automation",
     "AutomationLog",
     "CreatorAnalytics",

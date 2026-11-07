@@ -1,4 +1,5 @@
 import urllib.parse
+from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, Request, Response, HTTPException, status, Query
 from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
@@ -33,7 +34,7 @@ from app.services.instagram_service import (
     get_instagram_connection_status,
     refresh_workspace_instagram_token
 )
-from app.models.instagram import InstagramAccount
+from app.models.instagram import InstagramAccount, InstagramDataDeletionRequest
 from app.security import get_current_user, rate_limit
 
 router = APIRouter(prefix="/instagram", tags=["Instagram Integration"])
@@ -271,7 +272,11 @@ async def meta_deauthorize_callback(request: Request, db: Session = Depends(get_
 # Official Meta User Data Deletion Callback
 @router.post("/data-deletion")
 async def meta_data_deletion_callback(request: Request, db: Session = Depends(get_db)):
-    """Receives Meta signed_request when user requests data deletion via Instagram settings."""
+    """
+    Receives Meta signed_request when user requests data deletion via Instagram settings.
+    Validates HMAC signature, provides idempotent retries, creates persistent records,
+    purges Instagram-derived credentials and active automations without deleting unrelated workspace data.
+    """
     form_data = await request.form()
     signed_request = form_data.get("signed_request")
     if not signed_request:
@@ -290,15 +295,61 @@ async def meta_data_deletion_callback(request: Request, db: Session = Depends(ge
     if not payload:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid signed_request signature")
 
-    import uuid
-    confirmation_code = f"woka_del_{uuid.uuid4().hex[:12]}"
     user_id = payload.get("user_id")
-    if user_id:
-        account = db.query(InstagramAccount).filter(InstagramAccount.ig_user_id == str(user_id)).first()
-        if account:
+    if not user_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing user_id in signed_request payload")
+
+    str_user_id = str(user_id)
+
+    # Idempotent Retries: check if a deletion request already exists for this ig_user_id
+    existing_req = db.query(InstagramDataDeletionRequest).filter(
+        InstagramDataDeletionRequest.ig_user_id == str_user_id
+    ).order_by(InstagramDataDeletionRequest.created_at.desc()).first()
+
+    if existing_req and existing_req.status == "COMPLETED":
+        return {
+            "url": f"{settings.FRONTEND_URL}/deletion-status?code={existing_req.confirmation_code}",
+            "confirmation_code": existing_req.confirmation_code
+        }
+
+    import uuid
+    confirmation_code = existing_req.confirmation_code if existing_req else f"woka_del_{uuid.uuid4().hex[:12]}"
+    deletion_req = existing_req or InstagramDataDeletionRequest(
+        confirmation_code=confirmation_code,
+        ig_user_id=str_user_id,
+        status="PENDING"
+    )
+    if not existing_req:
+        db.add(deletion_req)
+    db.flush()
+
+    try:
+        # Actual deletion of applicable Instagram-derived data (without deleting unrelated workspace data)
+        accounts = db.query(InstagramAccount).filter(InstagramAccount.ig_user_id == str_user_id).all()
+        for account in accounts:
             account.is_connected = False
             account.encrypted_access_token = ""
-            db.commit()
+            account.token_expires_at = None
+            account.profile_pic_url = None
+            account.granted_permissions = ""
+
+            # Deactivate any active automations tied specifically to this Instagram account
+            from app.models.automation import Automation
+            db.query(Automation).filter(Automation.ig_account_id == account.id).update(
+                {"is_active": False},
+                synchronize_session=False
+            )
+
+        deletion_req.status = "COMPLETED"
+        deletion_req.completed_at = datetime.now(timezone.utc)
+        deletion_req.details = f"Purged access tokens, profile picture, permissions, and deactivated automations for ig_user_id {str_user_id}."
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        deletion_req.status = "FAILED"
+        deletion_req.details = f"Data deletion failed: {str(e)}"
+        db.commit()
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to process user data deletion request")
 
     return {
         "url": f"{settings.FRONTEND_URL}/deletion-status?code={confirmation_code}",
@@ -356,10 +407,33 @@ def get_endpoints_info():
 
 
 @router.get("/deletion-status")
-def get_deletion_status(code: str = Query(..., description="Data deletion confirmation code")):
-    """Verifies that a user data deletion request was received and processed."""
+def get_deletion_status(
+    code: str = Query(..., description="Data deletion confirmation code"),
+    db: Session = Depends(get_db)
+):
+    """
+    Verifies the status of a user data deletion request.
+    Returns honest PENDING, COMPLETED, or FAILED status from persistent records.
+    Rejects unknown codes with 404 (no false COMPLETED response).
+    """
+    record = db.query(InstagramDataDeletionRequest).filter(
+        InstagramDataDeletionRequest.confirmation_code == code
+    ).first()
+
+    if not record:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Data deletion confirmation code '{code}' not found."
+        )
+
     return {
-        "confirmation_code": code,
-        "status": "COMPLETED",
-        "message": "User data deletion request has been processed. Access tokens and profile associations have been purged."
+        "confirmation_code": record.confirmation_code,
+        "status": record.status,
+        "message": record.details or (
+            "User data deletion request has been processed. Access tokens and profile associations have been purged."
+            if record.status == "COMPLETED"
+            else "Data deletion request is currently pending processing."
+        ),
+        "created_at": record.created_at.isoformat() if record.created_at else None,
+        "completed_at": record.completed_at.isoformat() if record.completed_at else None
     }

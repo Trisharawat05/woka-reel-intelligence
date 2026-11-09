@@ -85,7 +85,9 @@ def test_production_security_validation_scheme_and_domain():
         ENVIRONMENT="production",
         BACKEND_PUBLIC_URL="https://woka-api-staging.onrender.com",
         META_APP_ID="3217043811838822",
-        META_APP_SECRET="supersecret12345678901234567890"
+        META_APP_SECRET="supersecret12345678901234567890",
+        META_VERIFY_TOKEN="valid_custom_prod_verify_token_2026",
+        ALLOWED_HOSTS=["woka-api-staging.onrender.com"]
     )
     assert prod_valid.effective_instagram_redirect_uri == "https://woka-api-staging.onrender.com/api/v1/instagram/callback"
     assert prod_valid.META_REDIRECT_URI == "https://woka-api-staging.onrender.com/api/v1/instagram/callback"

@@ -3,10 +3,13 @@ import re
 import json
 import uuid
 import shutil
+import logging
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
 from sqlalchemy.orm import Session
 from fastapi import HTTPException, status, UploadFile
+
+logger = logging.getLogger(__name__)
 
 import socket
 import ipaddress
@@ -205,26 +208,26 @@ def create_upload_analysis_job(
     workspace_id: str,
     file: UploadFile
 ) -> ReelAnalysisJob:
-    """Validates and stores uploaded video file, creating an analysis job with magic byte verification."""
+    """
+    Validates and stores an uploaded video file, creating an analysis job with magic byte verification.
+
+    Transaction & Quota Consistency Strategy:
+    1. Pre-allocation validation: MIME format and header magic bytes are verified BEFORE quota consumption,
+       preventing malicious or invalid payloads from draining creator quota.
+    2. Compensation pattern: Quota increment is tracked via `quota_incremented`. If any subsequent failure
+       occurs (100MB streaming size limit breach, network disconnect mid-stream, OS disk error, or database
+       persistence failure), active transactions are rolled back, partial temporary files are deleted,
+       and a compensating transaction refunds the allocated quota unit.
+    3. Persistence atomicity: ReelMediaAsset and ReelAnalysisJob are flushed and committed in a single transaction
+       to prevent orphaned assets or jobs.
+    4. Limitation: In the event of an unrecoverable process crash or persistent database outage between the initial
+       quota commit and compensation commit, reconciliation relies on regular subscription billing cycle resets.
+    """
     if file.content_type not in ALLOWED_VIDEO_MIMES:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Unsupported video format: '{file.content_type}'. Supported formats: MP4, MOV, WebM."
         )
-
-    # Check quota
-    if not check_and_increment_ai_quota(db, workspace_id):
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="Monthly Reel AI analysis quota exceeded for your workspace plan. Please upgrade your subscription."
-        )
-
-    # Secure local workspace storage directory
-    workspace_media_dir = os.path.join(STORAGE_BASE_DIR, workspace_id)
-    os.makedirs(workspace_media_dir, exist_ok=True)
-
-    safe_filename = f"{uuid.uuid4()}_{os.path.basename(file.filename or 'upload.mp4')}"
-    file_path = os.path.join(workspace_media_dir, safe_filename)
 
     # Read header for magic bytes inspection
     header_chunk = file.file.read(64)
@@ -234,47 +237,96 @@ def create_upload_analysis_job(
             detail="Uploaded file signature does not match a valid, safe video stream."
         )
 
-    # Read and enforce file size constraint
-    file_size = len(header_chunk)
-    with open(file_path, "wb") as buffer:
-        buffer.write(header_chunk)
-        while chunk := file.file.read(1024 * 1024):  # 1MB chunks
-            file_size += len(chunk)
-            if file_size > MAX_VIDEO_SIZE_BYTES:
-                buffer.close()
+    # Check quota only after verifying MIME and magic bytes (prevents malicious/invalid payloads from draining quota)
+    if not check_and_increment_ai_quota(db, workspace_id):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Monthly Reel AI analysis quota exceeded for your workspace plan. Please upgrade your subscription."
+        )
+
+    quota_incremented = True
+    file_path: Optional[str] = None
+
+    try:
+        # Secure local workspace storage directory
+        workspace_media_dir = os.path.join(STORAGE_BASE_DIR, workspace_id)
+        os.makedirs(workspace_media_dir, exist_ok=True)
+
+        safe_filename = f"{uuid.uuid4()}_{os.path.basename(file.filename or 'upload.mp4')}"
+        file_path = os.path.join(workspace_media_dir, safe_filename)
+
+        # Read and enforce file size constraint while streaming chunks to disk
+        file_size = len(header_chunk)
+        with open(file_path, "wb") as buffer:
+            buffer.write(header_chunk)
+            while chunk := file.file.read(1024 * 1024):  # 1MB chunks
+                file_size += len(chunk)
+                if file_size > MAX_VIDEO_SIZE_BYTES:
+                    buffer.close()
+                    raise HTTPException(
+                        status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                        detail=f"File exceeds maximum allowed size of {MAX_VIDEO_SIZE_BYTES // (1024 * 1024)}MB."
+                    )
+                buffer.write(chunk)
+
+        # Atomic persistence of media asset and analysis job in a single commit
+        media_asset = ReelMediaAsset(
+            workspace_id=workspace_id,
+            storage_path=file_path,
+            original_filename=file.filename or "uploaded_reel.mp4",
+            file_size_bytes=file_size,
+            mime_type=file.content_type or "video/mp4",
+            is_temporary=True
+        )
+        db.add(media_asset)
+        db.flush()
+
+        job = ReelAnalysisJob(
+            workspace_id=workspace_id,
+            analysis_mode="VIDEO_UPLOAD",
+            input_type="upload",
+            status="QUEUED",
+            progress_percent=5,
+            stage_message="Video uploaded and queued for processing",
+            video_asset_id=media_asset.id
+        )
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+        return job
+
+    except Exception as exc:
+        # 1. Roll back any active or pending database transaction
+        try:
+            db.rollback()
+        except Exception as rb_err:
+            logger.warning(f"Database rollback failed during upload cleanup: {rb_err}")
+
+        # 2. Clean up partial or completed temporary file from disk on any failure
+        if file_path:
+            try:
                 if os.path.exists(file_path):
                     os.remove(file_path)
-                raise HTTPException(
-                    status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                    detail=f"File exceeds maximum allowed size of {MAX_VIDEO_SIZE_BYTES // (1024 * 1024)}MB."
-                )
-            buffer.write(chunk)
+            except OSError as fs_err:
+                logger.warning(f"Failed to remove temporary upload file during error cleanup: {fs_err}")
 
-    media_asset = ReelMediaAsset(
-        workspace_id=workspace_id,
-        storage_path=file_path,
-        original_filename=file.filename or "uploaded_reel.mp4",
-        file_size_bytes=file_size,
-        mime_type=file.content_type or "video/mp4",
-        is_temporary=True
-    )
-    db.add(media_asset)
-    db.commit()
-    db.refresh(media_asset)
+        # 3. Exactly one quota refund attempt if quota was incremented
+        if quota_incremented:
+            quota_incremented = False  # Guard against double-refund
+            try:
+                from app.services.subscription_service import get_workspace_subscription
+                sub = get_workspace_subscription(db, workspace_id)
+                sub.ai_used_monthly = max(0, sub.ai_used_monthly - 1)
+                db.commit()
+            except Exception as refund_err:
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+                logger.error(f"Failed to refund AI analysis quota after upload failure: {refund_err}")
 
-    job = ReelAnalysisJob(
-        workspace_id=workspace_id,
-        analysis_mode="VIDEO_UPLOAD",
-        input_type="upload",
-        status="QUEUED",
-        progress_percent=5,
-        stage_message="Video uploaded and queued for processing",
-        video_asset_id=media_asset.id
-    )
-    db.add(job)
-    db.commit()
-    db.refresh(job)
-    return job
+        # 4. Preserve and re-raise the original exception
+        raise exc
 
 
 def create_connected_reel_analysis_job(

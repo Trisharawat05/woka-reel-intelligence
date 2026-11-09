@@ -1,4 +1,6 @@
+import json
 import urllib.parse
+import uuid
 from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, Request, Response, HTTPException, status, Query
 from fastapi.responses import RedirectResponse
@@ -237,20 +239,49 @@ def toggle_sandbox(payload: InstagramSandboxToggleRequest, current_user: User = 
     )
     return InstagramAccountResponse.model_validate(account)
 
+async def extract_signed_request(request: Request) -> Optional[str]:
+    """
+    Safely extracts signed_request from application/x-www-form-urlencoded,
+    application/json, multipart/form-data, or query parameters without stream consumption issues.
+    """
+    if "signed_request" in request.query_params:
+        return request.query_params["signed_request"]
+
+    body_bytes = await request.body()
+    if not body_bytes:
+        return None
+
+    content_type = request.headers.get("content-type", "").lower()
+
+    if "application/json" in content_type:
+        try:
+            parsed_json = json.loads(body_bytes.decode("utf-8"))
+            if isinstance(parsed_json, dict) and "signed_request" in parsed_json:
+                return str(parsed_json["signed_request"])
+        except Exception:
+            pass
+
+    try:
+        parsed_form = urllib.parse.parse_qs(body_bytes.decode("utf-8"))
+        if "signed_request" in parsed_form and parsed_form["signed_request"]:
+            return parsed_form["signed_request"][0]
+    except Exception:
+        pass
+
+    try:
+        parsed_json = json.loads(body_bytes.decode("utf-8"))
+        if isinstance(parsed_json, dict) and "signed_request" in parsed_json:
+            return str(parsed_json["signed_request"])
+    except Exception:
+        pass
+
+    return None
+
 # Official Meta Deauthorize Callback
 @router.post("/deauthorize")
 async def meta_deauthorize_callback(request: Request, db: Session = Depends(get_db)):
     """Receives Meta signed_request when user removes app permissions via Instagram settings."""
-    form_data = await request.form()
-    signed_request = form_data.get("signed_request")
-    if not signed_request:
-        body_bytes = await request.body()
-        try:
-            import json
-            json_body = json.loads(body_bytes.decode())
-            signed_request = json_body.get("signed_request")
-        except Exception:
-            pass
+    signed_request = await extract_signed_request(request)
 
     if not signed_request:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing signed_request parameter")
@@ -274,19 +305,11 @@ async def meta_deauthorize_callback(request: Request, db: Session = Depends(get_
 async def meta_data_deletion_callback(request: Request, db: Session = Depends(get_db)):
     """
     Receives Meta signed_request when user requests data deletion via Instagram settings.
-    Validates HMAC signature, provides idempotent retries, creates persistent records,
-    purges Instagram-derived credentials and active automations without deleting unrelated workspace data.
+    Validates HMAC signature, provides idempotent retries, handles reconnected accounts,
+    persists PENDING/FAILED/COMPLETED states transactionally, and purges/anonymizes
+    all Instagram-derived identity and metrics without deleting unrelated workspace data.
     """
-    form_data = await request.form()
-    signed_request = form_data.get("signed_request")
-    if not signed_request:
-        body_bytes = await request.body()
-        try:
-            import json
-            json_body = json.loads(body_bytes.decode())
-            signed_request = json_body.get("signed_request")
-        except Exception:
-            pass
+    signed_request = await extract_signed_request(request)
 
     if not signed_request:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing signed_request parameter")
@@ -301,37 +324,50 @@ async def meta_data_deletion_callback(request: Request, db: Session = Depends(ge
 
     str_user_id = str(user_id)
 
-    # Idempotent Retries: check if a deletion request already exists for this ig_user_id
-    existing_req = db.query(InstagramDataDeletionRequest).filter(
-        InstagramDataDeletionRequest.ig_user_id == str_user_id
-    ).order_by(InstagramDataDeletionRequest.created_at.desc()).first()
+    # 1. Check if an active/connected account or un-deleted account exists for this ig_user_id
+    existing_account = db.query(InstagramAccount).filter(
+        InstagramAccount.ig_user_id == str_user_id
+    ).first()
 
-    if existing_req and existing_req.status == "COMPLETED":
-        return {
-            "url": f"{settings.FRONTEND_URL}/deletion-status?code={existing_req.confirmation_code}",
-            "confirmation_code": existing_req.confirmation_code
-        }
+    # 2. Idempotent Retry:
+    # If no account currently has this ig_user_id (meaning it was already deleted/anonymized in a prior request),
+    # return the latest recorded deletion request confirmation code.
+    if not existing_account:
+        existing_req = db.query(InstagramDataDeletionRequest).filter(
+            InstagramDataDeletionRequest.ig_user_id == str_user_id
+        ).order_by(InstagramDataDeletionRequest.created_at.desc()).first()
 
-    import uuid
-    confirmation_code = existing_req.confirmation_code if existing_req else f"woka_del_{uuid.uuid4().hex[:12]}"
-    deletion_req = existing_req or InstagramDataDeletionRequest(
+        if existing_req:
+            return {
+                "url": f"{settings.FRONTEND_URL}/deletion-status?code={existing_req.confirmation_code}",
+                "confirmation_code": existing_req.confirmation_code
+            }
+
+    # 3. Genuinely new deletion operation needed:
+    confirmation_code = f"woka_del_{uuid.uuid4().hex[:12]}"
+
+    # Phase 1: Persist the deletion request record as PENDING in its own transaction
+    deletion_req = InstagramDataDeletionRequest(
         confirmation_code=confirmation_code,
         ig_user_id=str_user_id,
-        status="PENDING"
+        status="PENDING",
+        details="Data deletion request received and pending processing."
     )
-    if not existing_req:
-        db.add(deletion_req)
-    db.flush()
+    db.add(deletion_req)
+    db.commit()
 
+    # Phase 2: Execute data deletion and anonymization in a guarded transaction
     try:
-        # Comprehensive deletion of applicable Instagram-derived data (without deleting unrelated workspace data)
         from app.models.automation import Automation, AutomationLog
         from app.models.analytics import CreatorAnalytics
         from app.models.reel_intelligence import ReelAnalysisJob, ReelMetricSnapshot, ReelReport
         from app.models.profile import CreatorProfile
 
+        # Query all accounts matching this ig_user_id
         accounts = db.query(InstagramAccount).filter(InstagramAccount.ig_user_id == str_user_id).all()
         for account in accounts:
+            account_id_prefix = account.id[:8] if account.id else uuid.uuid4().hex[:8]
+            # Anonymize/purge identity fields
             account.is_connected = False
             account.encrypted_access_token = ""
             account.token_expires_at = None
@@ -339,6 +375,9 @@ async def meta_data_deletion_callback(request: Request, db: Session = Depends(ge
             account.granted_permissions = ""
             account.followers_count = 0
             account.media_count = 0
+            account.name = None
+            account.username = f"deleted_user_{account_id_prefix}"
+            account.ig_user_id = f"deleted_ig_{uuid.uuid4().hex[:12]}"
 
             # 1. Automations & logs tied to this Instagram account
             automations = db.query(Automation).filter(Automation.ig_account_id == account.id).all()
@@ -373,37 +412,53 @@ async def meta_data_deletion_callback(request: Request, db: Session = Depends(ge
             for cj in connected_jobs:
                 db.query(ReelMetricSnapshot).filter(ReelMetricSnapshot.job_id == cj.id).delete(synchronize_session=False)
                 cj.source_media_id = None
+                if cj.source_url and ("cdninstagram" in cj.source_url or "fbcdn" in cj.source_url or "instagram.com" in cj.source_url):
+                    cj.source_url = None
                 reports = db.query(ReelReport).filter((ReelReport.job_id == cj.id) | (ReelReport.id == cj.report_id)).all()
                 for rep in reports:
                     rep.caption = None
                     rep.calculated_metrics_json = "{}"
-
-
-
-
-
+                    if rep.thumbnail_url and ("cdninstagram" in rep.thumbnail_url or "fbcdn" in rep.thumbnail_url):
+                        rep.thumbnail_url = None
 
             # 4. CreatorProfile: clear avatar if synchronized from Instagram CDN
             profile = db.query(CreatorProfile).filter(CreatorProfile.workspace_id == account.workspace_id).first()
             if profile and profile.avatar_url and ("cdninstagram" in profile.avatar_url or "fbcdn" in profile.avatar_url):
                 profile.avatar_url = None
 
-        # Also purge any dangling AutomationLogs referencing this recipient_ig_id
+        # Purge any dangling AutomationLogs referencing this recipient_ig_id
         db.query(AutomationLog).filter(AutomationLog.recipient_ig_id == str_user_id).delete(synchronize_session=False)
 
-        deletion_req.status = "COMPLETED"
-        deletion_req.completed_at = datetime.now(timezone.utc)
-        deletion_req.details = (
-            f"Purged Instagram access tokens, cached profile data, audience demographics, "
-            f"top posts, automation logs, and connected reel private metrics for ig_user_id {str_user_id}."
-        )
+        # Mark deletion request as COMPLETED (minimum information retained, no ig_user_id or tokens in details)
+        req_to_update = db.query(InstagramDataDeletionRequest).filter(
+            InstagramDataDeletionRequest.confirmation_code == confirmation_code
+        ).first()
+        if req_to_update:
+            req_to_update.status = "COMPLETED"
+            req_to_update.completed_at = datetime.now(timezone.utc)
+            if accounts:
+                req_to_update.details = "Instagram access tokens, profile attributes, audience metrics, and associated integration records purged successfully."
+            else:
+                req_to_update.details = "No user data found to delete."
         db.commit()
-    except Exception as e:
+    except Exception:
         db.rollback()
-        deletion_req.status = "FAILED"
-        deletion_req.details = f"Data deletion failed: {str(e)}"
-        db.commit()
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to process user data deletion request")
+        # In a separate transaction, update the persisted request to FAILED
+        try:
+            failed_req = db.query(InstagramDataDeletionRequest).filter(
+                InstagramDataDeletionRequest.confirmation_code == confirmation_code
+            ).first()
+            if failed_req:
+                failed_req.status = "FAILED"
+                failed_req.completed_at = datetime.now(timezone.utc)
+                failed_req.details = "Data deletion operation could not be completed."
+                db.commit()
+        except Exception:
+            db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to process user data deletion request"
+        )
 
     return {
         "url": f"{settings.FRONTEND_URL}/deletion-status?code={confirmation_code}",
@@ -435,7 +490,6 @@ async def meta_webhook_receiver(request: Request, db: Session = Depends(get_db))
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid signature")
 
     try:
-        import json
         event_data = json.loads(body_bytes.decode())
     except Exception:
         event_data = {}

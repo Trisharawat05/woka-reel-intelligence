@@ -122,7 +122,7 @@ class Settings(BaseSettings):
         "https://woka-reel-intelligence.vercel.app"
     ]
     ALLOWED_HOSTS: List[str] = Field(
-        default=["*"],
+        default=["localhost", "127.0.0.1", "testserver"],
         description="Allowed host headers for TrustedHostMiddleware"
     )
 
@@ -160,13 +160,19 @@ class Settings(BaseSettings):
     def parse_cors_origins(cls, v: Any) -> Any:
         if isinstance(v, str):
             v_str = v.strip()
+            if not v_str:
+                return []
             if v_str.startswith("[") and v_str.endswith("]"):
                 import json
                 try:
-                    return json.loads(v_str)
+                    parsed = json.loads(v_str)
+                    if isinstance(parsed, list):
+                        return [str(origin).strip() for origin in parsed if str(origin).strip()]
                 except Exception:
                     pass
             return [origin.strip() for origin in v_str.split(",") if origin.strip()]
+        elif isinstance(v, (list, tuple, set)):
+            return [str(origin).strip() for origin in v if str(origin).strip()]
         return v
 
     @field_validator("ALLOWED_HOSTS", mode="before")
@@ -174,13 +180,19 @@ class Settings(BaseSettings):
     def parse_allowed_hosts(cls, v: Any) -> Any:
         if isinstance(v, str):
             v_str = v.strip()
+            if not v_str:
+                return []
             if v_str.startswith("[") and v_str.endswith("]"):
                 import json
                 try:
-                    return json.loads(v_str)
+                    parsed = json.loads(v_str)
+                    if isinstance(parsed, list):
+                        return [str(host).strip() for host in parsed if str(host).strip()]
                 except Exception:
                     pass
             return [host.strip() for host in v_str.split(",") if host.strip()]
+        elif isinstance(v, (list, tuple, set)):
+            return [str(host).strip() for host in v if str(host).strip()]
         return v
 
     @property
@@ -231,11 +243,18 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_production_security(self):
+        is_prod = self.ENVIRONMENT.lower() == "production"
+
         # Auto-include FRONTEND_URL in CORS_ORIGINS to prevent cross-origin mismatches
         if self.FRONTEND_URL:
-            self.FRONTEND_URL = self.FRONTEND_URL.strip().rstrip("/")
-            if self.FRONTEND_URL not in self.CORS_ORIGINS:
-                self.CORS_ORIGINS.append(self.FRONTEND_URL)
+            clean_frontend = self.FRONTEND_URL.strip().rstrip("/")
+            if is_prod:
+                if clean_frontend.startswith("https://") and not any(dev in clean_frontend.lower() for dev in ("localhost", "127.0.0.1")):
+                    if clean_frontend not in self.CORS_ORIGINS:
+                        self.CORS_ORIGINS.append(clean_frontend)
+            else:
+                if clean_frontend not in self.CORS_ORIGINS:
+                    self.CORS_ORIGINS.append(clean_frontend)
 
         if self.META_CLIENT_SECRET:
             self.META_APP_SECRET = self.META_CLIENT_SECRET
@@ -257,22 +276,29 @@ class Settings(BaseSettings):
                 self.META_REDIRECT_URI = validate_and_normalize_redirect_uri(canonical_uri, api_v1_str=self.API_V1_STR)
 
                 if clean_public not in self.CORS_ORIGINS:
-                    self.CORS_ORIGINS.append(clean_public)
+                    if not is_prod or (clean_public.startswith("https://") and not is_local):
+                        self.CORS_ORIGINS.append(clean_public)
+
                 host = parsed_base.netloc
-                if host and "*" not in self.ALLOWED_HOSTS and host not in self.ALLOWED_HOSTS:
+                if host and self.ALLOWED_HOSTS and "*" not in self.ALLOWED_HOSTS and host not in self.ALLOWED_HOSTS:
                     self.ALLOWED_HOSTS.append(host)
         else:
             if self.META_REDIRECT_URI:
                 clean_redirect = self.META_REDIRECT_URI.strip().rstrip("/")
                 self.META_REDIRECT_URI = validate_and_normalize_redirect_uri(clean_redirect, api_v1_str=self.API_V1_STR)
 
-        if self.ENVIRONMENT.lower() == "production":
+        if is_prod:
+            # 1. JWT & Token Encryption Secrets
             default_secret = "woka-super-secret-production-grade-signing-key-32chars-min!"
             default_fernet = "eF9rVlBfZkRzQ3ZfU0VDUkVUX0tFWV8xMjM0NTY3ODk="
-            if self.SECRET_KEY == default_secret:
+            if not self.SECRET_KEY or self.SECRET_KEY.strip() == default_secret:
                 raise ValueError("CRITICAL SECURITY VIOLATION: Default SECRET_KEY cannot be used in production environment.")
-            if self.TOKEN_ENCRYPTION_KEY == default_fernet:
+            if len(self.SECRET_KEY.strip()) < 32:
+                raise ValueError("CRITICAL SECURITY VIOLATION: Production SECRET_KEY must be at least 32 characters.")
+            if not self.TOKEN_ENCRYPTION_KEY or self.TOKEN_ENCRYPTION_KEY.strip() == default_fernet:
                 raise ValueError("CRITICAL SECURITY VIOLATION: Default TOKEN_ENCRYPTION_KEY cannot be used in production environment.")
+
+            # 2. Meta OAuth & App Credentials
             if not self.META_APP_ID or self.META_APP_ID.startswith("mock_"):
                 raise ValueError("CRITICAL CONFIGURATION ERROR: Valid META_APP_ID must be configured for production.")
             if not self.META_APP_SECRET or self.META_APP_SECRET.startswith("mock_"):
@@ -281,6 +307,62 @@ class Settings(BaseSettings):
                 raise ValueError("CRITICAL CONFIGURATION ERROR: Valid META_REDIRECT_URI must be configured for production.")
             if self.ENABLE_MOCK_OAUTH:
                 raise ValueError("CRITICAL SECURITY VIOLATION: ENABLE_MOCK_OAUTH cannot be true in production environment.")
+
+            # 3. Enforce custom META_VERIFY_TOKEN
+            default_verify = "woka_meta_webhook_verify_token_2026"
+            clean_verify = (self.META_VERIFY_TOKEN or "").strip()
+            if not clean_verify:
+                raise ValueError("CRITICAL CONFIGURATION ERROR: META_VERIFY_TOKEN cannot be empty in production.")
+            if clean_verify == default_verify:
+                raise ValueError("CRITICAL SECURITY VIOLATION: Default META_VERIFY_TOKEN cannot be used in production environment.")
+
+            # 4. Strict ALLOWED_HOSTS validation
+            if not self.ALLOWED_HOSTS:
+                raise ValueError("CRITICAL CONFIGURATION ERROR: ALLOWED_HOSTS cannot be empty in production.")
+            if "*" in self.ALLOWED_HOSTS or any("*" in str(h) for h in self.ALLOWED_HOSTS):
+                raise ValueError("CRITICAL SECURITY VIOLATION: Wildcard '*' is strictly forbidden in ALLOWED_HOSTS in production.")
+
+            clean_allowed_hosts = []
+            for raw_host in self.ALLOWED_HOSTS:
+                h = str(raw_host).strip()
+                if not h:
+                    raise ValueError("CRITICAL CONFIGURATION ERROR: Empty host entry in ALLOWED_HOSTS.")
+                if h.startswith("http://") or h.startswith("https://") or "://" in h:
+                    raise ValueError(f"CRITICAL CONFIGURATION ERROR: Malformed host '{h}' in ALLOWED_HOSTS. Hosts must not include URL schemes.")
+                if any(c in h for c in ("/", chr(92), "?", "#", "@", " ")):
+                    raise ValueError(f"CRITICAL CONFIGURATION ERROR: Malformed host '{h}' in ALLOWED_HOSTS. Invalid characters detected.")
+                clean_allowed_hosts.append(h)
+
+            dev_host_set = {"localhost", "127.0.0.1", "testserver"}
+            if set(clean_allowed_hosts).issubset(dev_host_set):
+                raise ValueError("CRITICAL SECURITY VIOLATION: Production requires an explicit host allowlist (default development hosts are not permitted in production).")
+
+            self.ALLOWED_HOSTS = clean_allowed_hosts
+
+            # 5. Harden CORS Configuration
+            if not self.CORS_ORIGINS:
+                raise ValueError("CRITICAL SECURITY VIOLATION: CORS_ORIGINS cannot be empty in production.")
+            if "*" in self.CORS_ORIGINS or any("*" in str(orig) for orig in self.CORS_ORIGINS):
+                raise ValueError("CRITICAL SECURITY VIOLATION: Wildcard '*' is strictly forbidden in CORS_ORIGINS in production.")
+
+            # Remove development localhost/127.0.0.1 origins in production
+            filtered_origins = [
+                origin.strip().rstrip("/") for origin in self.CORS_ORIGINS
+                if not any(dev in origin.lower() for dev in ("localhost", "127.0.0.1"))
+            ]
+            if not filtered_origins:
+                raise ValueError("CRITICAL SECURITY VIOLATION: No approved production HTTPS frontend origins found in CORS_ORIGINS.")
+
+            # Validate each origin is valid HTTPS
+            for origin in filtered_origins:
+                parsed_origin = urllib.parse.urlparse(origin)
+                if parsed_origin.scheme != "https":
+                    raise ValueError(f"CRITICAL SECURITY VIOLATION: Production CORS origin '{origin}' must use HTTPS.")
+                if not parsed_origin.netloc or not parsed_origin.hostname:
+                    raise ValueError(f"CRITICAL CONFIGURATION ERROR: Malformed production CORS origin '{origin}'. Missing valid host.")
+
+            self.CORS_ORIGINS = filtered_origins
+
         return self
 
 settings = Settings()

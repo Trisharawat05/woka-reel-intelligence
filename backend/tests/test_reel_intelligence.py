@@ -271,6 +271,50 @@ def test_ssrf_and_private_network_rejection(client, auth_headers):
         assert res.status_code == 422, f"Target {target} should have been rejected with 422"
 
 
+def generate_minimal_mp4_bytes() -> bytes:
+    """
+    Generates a genuinely valid, decodable, minimal MP4 container with valid ftyp, moov, and mdat atoms.
+    Attempts dynamic generation with OpenCV if available, or falls back to a deterministic 919-byte 1-frame MP4.
+    """
+    try:
+        import cv2
+        import numpy as np
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+            tmp_path = tmp.name
+        try:
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            out = cv2.VideoWriter(tmp_path, fourcc, 10.0, (64, 64))
+            out.write(np.zeros((64, 64, 3), dtype=np.uint8))
+            out.release()
+            with open(tmp_path, "rb") as f:
+                content = f.read()
+            if content and b"moov" in content and b"ftyp" in content:
+                return content
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+    except Exception:
+        pass
+
+    import base64
+    return base64.b64decode(
+        "AAAAHGZ0eXBpc29tAAACAGlzb21pc28ybXA0MQAAAAhmcmVlAAAAQ21kYXQAAAGzABAHAAABthDA4wR7b+Ntv422/jbb+Ntv422"
+        "/jbb+Ntv422/jbb+Ntv422/jbb+Ntv422/jbb9wAAAzBtb292AAAAbG12aGQAAAAAAAAAAAAAAAAAAAPoAAAAZAABAAABAAAAAA"
+        "AAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAAACW3"
+        "RyYWsAAABcdGtoZAAAAAMAAAAAAAAAAAAAAAEAAAAAAAAAZAAAAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAEAAAAAAAA"
+        "AAAAAAAAAAEAAAAAAQAAAAEAAAAAAACRlZHRzAAAAHGVsc3QAAAAAAAAAAQAAAGQAAAAAAAEAAAAAAdNtZGlhAAAAIG1kaGQAAAA"
+        "AAAAAAAAAAAAAACgAAAAEAFXEAAAAAAAtaGRscgAAAAAAAAAAdmlkZQAAAAAAAAAAAAAAAFZpZGVvSGFuZGxlcgAAAAF+bWluZgA"
+        "AABR2bWhkAAAAAQAAAAAAAAAAAAAAJGRpbmYAAAAcZHJlZgAAAAAAAAABAAAADHVybCAAAAABAAABPnN0YmwAAADac3RzZAAAAAA"
+        "AAAABAAAAym1wNHYAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAQABAAEgAAABIAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAY//8AAABgZXNkcwAAAAADgICATwABAASAgIBBIBEAAAAAAUAAAAAScAWAgIAvAAABsAEAAAG1iRMAAAEAAA"
+        "ABIADEjYgAVQIECBRjAAABskxhdmM2MS4xOS4xMDAGgICAAQIAAAAUYnRydAAAAAAAAUAAAAAScAAAABhzdHRzAAAAAAAAAAEAA"
+        "AABAAAEAAAAABxzdHNjAAAAAAAAAAEAAAABAAAAAQAAAAEAAAAUc3RzegAAAAAAAAA7AAAAAQAAABRzdGNvAAAAAAAAAAEAAAAsA"
+        "AAAYXVkdGEAAABZbWV0YQAAAAAAAAAhaGRscgAAAAAAAAAAbWRpcmFwcGwAAAAAAAAAAAAAAAAsaWxzdAAAACSpdG9vAAAAHGRhd"
+        "GEAAAABAAAAAExhdmY2MS43LjEwMA=="
+    )
+
+
 def test_upload_magic_bytes_inspection(client, auth_headers):
     """Ensures disguised executable payloads are rejected and valid video streams are accepted."""
     import io
@@ -294,9 +338,9 @@ def test_upload_magic_bytes_inspection(client, auth_headers):
     )
     assert res_mime.status_code == 400
 
-    # 3. Accept valid MP4 container
-    valid_mp4_header = b"\x00\x00\x00\x1cftypisom\x00\x00\x02\x00isomiso2mp41\x00\x00\x00\x08free\x00\x00\x00\x08mdat"
-    valid_video = io.BytesIO(valid_mp4_header + b"\x00" * 1024)
+    # 3. Accept valid MP4 container (fully formed with ftyp, moov, and mdat atoms)
+    valid_video_bytes = generate_minimal_mp4_bytes()
+    valid_video = io.BytesIO(valid_video_bytes)
     res_valid = client.post(
         "/api/v1/reel-intelligence/jobs/upload",
         files={"file": ("good_reel.mp4", valid_video, "video/mp4")},
@@ -309,7 +353,7 @@ def test_upload_magic_bytes_inspection(client, auth_headers):
     # Poll status -> TestClient executes BackgroundTasks before return, so status is COMPLETED
     poll = client.get(f"/api/v1/reel-intelligence/jobs/{upload_job_id}", headers=auth_headers)
     assert poll.status_code == 200
-    assert poll.json()["status"] == "COMPLETED"
+    assert poll.json()["status"] == "COMPLETED", f"Job failed: {poll.json().get('error_message')}"
     upload_report_id = poll.json()["report_id"]
     assert upload_report_id is not None
 
@@ -318,6 +362,199 @@ def test_upload_magic_bytes_inspection(client, auth_headers):
     assert rep.status_code == 200
     assert rep.json()["analysis_mode"] == "VIDEO_UPLOAD"
     assert "scores" in rep.json()
+
+
+def test_rejected_upload_does_not_consume_ai_quota(client, auth_headers, db_session, test_creator_user):
+    """
+    Regression test: ensures uploads rejected for invalid magic bytes or invalid MIME
+    do not decrement or consume the workspace's monthly AI analysis quota.
+    """
+    import io
+    from app.services.subscription_service import get_workspace_subscription
+
+    _, ws = test_creator_user
+    sub = get_workspace_subscription(db_session, ws.id)
+    initial_used = sub.ai_used_monthly
+
+    # 1. Reject disguised executable
+    fake_exe = io.BytesIO(b"MZ\x90\x00\x03\x00\x00\x00\x04\x00\x00\x00\xff\xff\x00\x00malicious binary content")
+    res1 = client.post(
+        "/api/v1/reel-intelligence/jobs/upload",
+        files={"file": ("malicious.mp4", fake_exe, "video/mp4")},
+        headers=auth_headers
+    )
+    assert res1.status_code == 422
+    db_session.refresh(sub)
+    assert sub.ai_used_monthly == initial_used, "Malicious upload rejection must not consume AI quota"
+
+    # 2. Reject unsupported MIME type
+    text_file = io.BytesIO(b"simple text content")
+    res2 = client.post(
+        "/api/v1/reel-intelligence/jobs/upload",
+        files={"file": ("doc.txt", text_file, "text/plain")},
+        headers=auth_headers
+    )
+    assert res2.status_code == 400
+    db_session.refresh(sub)
+    assert sub.ai_used_monthly == initial_used, "Invalid MIME upload rejection must not consume AI quota"
+
+
+def test_oversized_upload_refunds_quota_and_removes_file(client, auth_headers, db_session, test_creator_user, monkeypatch):
+    """
+    Regression test: ensures an upload exceeding MAX_VIDEO_SIZE_BYTES:
+    1. Returns HTTP 413 Payload Too Large.
+    2. Refunds exactly one quota unit (net change zero).
+    3. Removes the temporary file from media_storage.
+    4. Leaves no orphaned ReelMediaAsset or ReelAnalysisJob records.
+    """
+    import io
+    import os
+    import app.services.reel_intelligence_service as ris
+    from app.services.subscription_service import get_workspace_subscription
+    from app.models.reel_intelligence import ReelMediaAsset, ReelAnalysisJob
+
+    _, ws = test_creator_user
+    sub = get_workspace_subscription(db_session, ws.id)
+    initial_used = sub.ai_used_monthly
+
+    # Temporarily set MAX_VIDEO_SIZE_BYTES to 1500 bytes for deterministic testing
+    monkeypatch.setattr(ris, "MAX_VIDEO_SIZE_BYTES", 1500)
+
+    # Valid MP4 header (64 bytes) + padding to exceed 1500 bytes
+    valid_header = generate_minimal_mp4_bytes()[:64]
+    oversized_data = valid_header + b"\x00" * 3000
+    oversized_file = io.BytesIO(oversized_data)
+
+    res = client.post(
+        "/api/v1/reel-intelligence/jobs/upload",
+        files={"file": ("oversized_test.mp4", oversized_file, "video/mp4")},
+        headers=auth_headers
+    )
+    assert res.status_code == 413
+    assert "exceeds maximum allowed size" in res.json()["detail"].lower()
+
+    # 1. Verify quota was refunded
+    db_session.refresh(sub)
+    assert sub.ai_used_monthly == initial_used, "Oversized upload must refund the allocated quota unit"
+
+    # 2. Verify temporary file was deleted from disk
+    ws_dir = os.path.join(ris.STORAGE_BASE_DIR, ws.id)
+    if os.path.exists(ws_dir):
+        files = [f for f in os.listdir(ws_dir) if "oversized_test" in f]
+        assert len(files) == 0, f"Temporary file was not removed: {files}"
+
+    # 3. Verify no orphaned database records
+    assets = db_session.query(ReelMediaAsset).filter(ReelMediaAsset.workspace_id == ws.id).all()
+    assert len(assets) == 0, "No ReelMediaAsset record should exist for rejected oversized file"
+    jobs = db_session.query(ReelAnalysisJob).filter(ReelAnalysisJob.workspace_id == ws.id).all()
+    assert len(jobs) == 0, "No ReelAnalysisJob should exist for rejected oversized file"
+
+
+def test_streaming_exception_refunds_quota_and_cleans_file(client, auth_headers, db_session, test_creator_user, monkeypatch):
+    """
+    Regression test: ensures unexpected streaming exceptions (network disconnect mid-stream):
+    1. Propagate safely to the caller.
+    2. Refund the allocated quota unit.
+    3. Remove any partially written temporary file from media_storage.
+    4. Leave no orphaned database records.
+    """
+    import io
+    import os
+    import tempfile
+    import app.services.reel_intelligence_service as ris
+    from app.services.subscription_service import get_workspace_subscription
+    from app.models.reel_intelligence import ReelMediaAsset, ReelAnalysisJob
+
+    _, ws = test_creator_user
+    sub = get_workspace_subscription(db_session, ws.id)
+    initial_used = sub.ai_used_monthly
+
+    valid_video = io.BytesIO(generate_minimal_mp4_bytes() + b"\x00" * 2048)
+
+    orig_read = tempfile.SpooledTemporaryFile.read
+    def faulty_read(self, *args, **kwargs):
+        if len(args) > 0 and args[0] == 1024 * 1024:
+            raise IOError("Simulated network disconnect during chunk streaming")
+        return orig_read(self, *args, **kwargs)
+
+    monkeypatch.setattr(tempfile.SpooledTemporaryFile, "read", faulty_read)
+
+    with pytest.raises(IOError, match="Simulated network disconnect"):
+        client.post(
+            "/api/v1/reel-intelligence/jobs/upload",
+            files={"file": ("stream_fault_test.mp4", valid_video, "video/mp4")},
+            headers=auth_headers
+        )
+
+    # 1. Verify quota was refunded
+    db_session.refresh(sub)
+    assert sub.ai_used_monthly == initial_used, "Streaming exception must refund the allocated quota unit"
+
+    # 2. Verify temporary file was deleted from disk
+    ws_dir = os.path.join(ris.STORAGE_BASE_DIR, ws.id)
+    if os.path.exists(ws_dir):
+        files = [f for f in os.listdir(ws_dir) if "stream_fault_test" in f]
+        assert len(files) == 0, f"Partial temporary file was not removed: {files}"
+
+    # 3. Verify no orphaned database records
+    assets = db_session.query(ReelMediaAsset).filter(ReelMediaAsset.workspace_id == ws.id).all()
+    assert len(assets) == 0, "No ReelMediaAsset record should exist after streaming failure"
+    jobs = db_session.query(ReelAnalysisJob).filter(ReelAnalysisJob.workspace_id == ws.id).all()
+    assert len(jobs) == 0, "No ReelAnalysisJob should exist after streaming failure"
+
+
+def test_db_commit_failure_during_job_creation_refunds_quota_and_cleans_file(client, auth_headers, db_session, test_creator_user, monkeypatch):
+    """
+    Regression test: ensures database failure during asset/job persistence:
+    1. Propagates the database exception.
+    2. Refunds the allocated quota unit via compensation.
+    3. Removes the written temporary file from media_storage.
+    4. Leaves no orphaned media assets or jobs in the database.
+    """
+    import io
+    import os
+    from sqlalchemy.exc import SQLAlchemyError
+    import app.services.reel_intelligence_service as ris
+    from app.services.subscription_service import get_workspace_subscription
+    from app.models.reel_intelligence import ReelMediaAsset, ReelAnalysisJob
+
+    _, ws = test_creator_user
+    sub = get_workspace_subscription(db_session, ws.id)
+    initial_used = sub.ai_used_monthly
+
+    valid_video = io.BytesIO(generate_minimal_mp4_bytes())
+
+    orig_flush = db_session.flush
+    def faulty_flush(*args, **kwargs):
+        raise SQLAlchemyError("Simulated database constraint or connection failure on flush")
+
+    monkeypatch.setattr(db_session, "flush", faulty_flush)
+
+    with pytest.raises(SQLAlchemyError, match="Simulated database constraint"):
+        client.post(
+            "/api/v1/reel-intelligence/jobs/upload",
+            files={"file": ("db_fault_test.mp4", valid_video, "video/mp4")},
+            headers=auth_headers
+        )
+
+    # Restore flush so test assertions can query the database
+    monkeypatch.setattr(db_session, "flush", orig_flush)
+
+    # 1. Verify quota was refunded
+    db_session.refresh(sub)
+    assert sub.ai_used_monthly == initial_used, "Database failure must refund the allocated quota unit"
+
+    # 2. Verify temporary file was deleted from disk
+    ws_dir = os.path.join(ris.STORAGE_BASE_DIR, ws.id)
+    if os.path.exists(ws_dir):
+        files = [f for f in os.listdir(ws_dir) if "db_fault_test" in f]
+        assert len(files) == 0, f"Temporary file was not removed after DB failure: {files}"
+
+    # 3. Verify no orphaned database records
+    assets = db_session.query(ReelMediaAsset).filter(ReelMediaAsset.workspace_id == ws.id).all()
+    assert len(assets) == 0, "No ReelMediaAsset should exist after DB failure"
+    jobs = db_session.query(ReelAnalysisJob).filter(ReelAnalysisJob.workspace_id == ws.id).all()
+    assert len(jobs) == 0, "No ReelAnalysisJob should exist after DB failure"
 
 
 

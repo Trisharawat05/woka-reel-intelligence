@@ -1,6 +1,6 @@
 import os
 import urllib.parse
-from typing import List, Any
+from typing import List, Any, Optional
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field, model_validator, field_validator
 
@@ -98,6 +98,7 @@ class Settings(BaseSettings):
     # Official Meta / Instagram App Credentials & Endpoints
     META_APP_ID: str = Field(default="mock_meta_app_id_12345", description="Meta Developer App ID")
     META_APP_SECRET: str = Field(default="mock_meta_app_secret_67890", description="Meta Developer App Secret")
+    META_CLIENT_SECRET: Optional[str] = Field(default=None, description="Documented alias for META_APP_SECRET")
     META_VERIFY_TOKEN: str = Field(default="woka_meta_webhook_verify_token_2026", description="Webhook handshake token")
     META_REDIRECT_URI: str = Field(default="", description="Canonical OAuth callback URI")
     META_API_VERSION: str = Field(default="v21.0", description="Meta Graph API version (e.g. v21.0)")
@@ -209,6 +210,11 @@ class Settings(BaseSettings):
         return self.effective_instagram_redirect_uri
 
     @property
+    def meta_client_secret(self) -> str:
+        """Documented alias for META_APP_SECRET."""
+        return self.META_APP_SECRET
+
+    @property
     def public_webhook_url(self) -> str:
         base = self.BACKEND_PUBLIC_URL.strip().rstrip('/') if self.BACKEND_PUBLIC_URL else "http://localhost:8000"
         return f"{base}{self.API_V1_STR}/instagram/webhook"
@@ -230,6 +236,9 @@ class Settings(BaseSettings):
             self.FRONTEND_URL = self.FRONTEND_URL.strip().rstrip("/")
             if self.FRONTEND_URL not in self.CORS_ORIGINS:
                 self.CORS_ORIGINS.append(self.FRONTEND_URL)
+
+        if self.META_CLIENT_SECRET:
+            self.META_APP_SECRET = self.META_CLIENT_SECRET
 
         # Dynamic ngrok / public URL handling & Callback URI Validation
         if self.BACKEND_PUBLIC_URL:

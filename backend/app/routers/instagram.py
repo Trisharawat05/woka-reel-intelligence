@@ -324,7 +324,12 @@ async def meta_data_deletion_callback(request: Request, db: Session = Depends(ge
     db.flush()
 
     try:
-        # Actual deletion of applicable Instagram-derived data (without deleting unrelated workspace data)
+        # Comprehensive deletion of applicable Instagram-derived data (without deleting unrelated workspace data)
+        from app.models.automation import Automation, AutomationLog
+        from app.models.analytics import CreatorAnalytics
+        from app.models.reel_intelligence import ReelAnalysisJob, ReelMetricSnapshot, ReelReport
+        from app.models.profile import CreatorProfile
+
         accounts = db.query(InstagramAccount).filter(InstagramAccount.ig_user_id == str_user_id).all()
         for account in accounts:
             account.is_connected = False
@@ -332,17 +337,66 @@ async def meta_data_deletion_callback(request: Request, db: Session = Depends(ge
             account.token_expires_at = None
             account.profile_pic_url = None
             account.granted_permissions = ""
+            account.followers_count = 0
+            account.media_count = 0
 
-            # Deactivate any active automations tied specifically to this Instagram account
-            from app.models.automation import Automation
+            # 1. Automations & logs tied to this Instagram account
+            automations = db.query(Automation).filter(Automation.ig_account_id == account.id).all()
+            automation_ids = [a.id for a in automations]
+            if automation_ids:
+                db.query(AutomationLog).filter(AutomationLog.automation_id.in_(automation_ids)).delete(synchronize_session=False)
+
+            # Deactivate automations and clear post targets
             db.query(Automation).filter(Automation.ig_account_id == account.id).update(
-                {"is_active": False},
+                {"is_active": False, "target_post_id": None, "target_post_preview_url": None},
                 synchronize_session=False
             )
 
+            # 2. CreatorAnalytics: purge audience insights and top posts derived from Instagram
+            analytics_records = db.query(CreatorAnalytics).filter(
+                CreatorAnalytics.workspace_id == account.workspace_id
+            ).all()
+            for ar in analytics_records:
+                ar.demographics_json = None
+                ar.top_posts_json = None
+                ar.reach_30d = 0
+                ar.impressions_30d = 0
+                ar.avg_engagement_rate = 0.0
+                ar.followers_count = 0
+                ar.media_count = 0
+
+            # 3. Connected Reel Intelligence: purge private Meta Graph API metrics
+            connected_jobs = db.query(ReelAnalysisJob).filter(
+                ReelAnalysisJob.workspace_id == account.workspace_id,
+                ReelAnalysisJob.analysis_mode == "CONNECTED_ACCOUNT"
+            ).all()
+            for cj in connected_jobs:
+                db.query(ReelMetricSnapshot).filter(ReelMetricSnapshot.job_id == cj.id).delete(synchronize_session=False)
+                cj.source_media_id = None
+                reports = db.query(ReelReport).filter((ReelReport.job_id == cj.id) | (ReelReport.id == cj.report_id)).all()
+                for rep in reports:
+                    rep.caption = None
+                    rep.calculated_metrics_json = "{}"
+
+
+
+
+
+
+            # 4. CreatorProfile: clear avatar if synchronized from Instagram CDN
+            profile = db.query(CreatorProfile).filter(CreatorProfile.workspace_id == account.workspace_id).first()
+            if profile and profile.avatar_url and ("cdninstagram" in profile.avatar_url or "fbcdn" in profile.avatar_url):
+                profile.avatar_url = None
+
+        # Also purge any dangling AutomationLogs referencing this recipient_ig_id
+        db.query(AutomationLog).filter(AutomationLog.recipient_ig_id == str_user_id).delete(synchronize_session=False)
+
         deletion_req.status = "COMPLETED"
         deletion_req.completed_at = datetime.now(timezone.utc)
-        deletion_req.details = f"Purged access tokens, profile picture, permissions, and deactivated automations for ig_user_id {str_user_id}."
+        deletion_req.details = (
+            f"Purged Instagram access tokens, cached profile data, audience demographics, "
+            f"top posts, automation logs, and connected reel private metrics for ig_user_id {str_user_id}."
+        )
         db.commit()
     except Exception as e:
         db.rollback()
@@ -426,14 +480,19 @@ def get_deletion_status(
             detail=f"Data deletion confirmation code '{code}' not found."
         )
 
+    if record.details:
+        message = record.details
+    elif record.status == "COMPLETED":
+        message = "User data deletion request has been processed. Access tokens and profile associations have been purged."
+    elif record.status == "FAILED":
+        message = "User data deletion request failed to process."
+    else:
+        message = "Data deletion request is currently pending processing."
+
     return {
         "confirmation_code": record.confirmation_code,
         "status": record.status,
-        "message": record.details or (
-            "User data deletion request has been processed. Access tokens and profile associations have been purged."
-            if record.status == "COMPLETED"
-            else "Data deletion request is currently pending processing."
-        ),
+        "message": message,
         "created_at": record.created_at.isoformat() if record.created_at else None,
         "completed_at": record.completed_at.isoformat() if record.completed_at else None
     }

@@ -364,3 +364,238 @@ def test_meta_data_deletion_callback_tampered_signature_rejected(client):
     res = client.post("/api/v1/instagram/data-deletion", data={"signed_request": tampered_signed_request})
     assert res.status_code == 401
     assert "invalid signed_request signature" in res.json()["detail"].lower()
+
+
+def test_meta_app_secret_alias_and_signed_request_verification():
+    """Verify META_CLIENT_SECRET alias and actual HMAC-SHA256 signed-request verification using META_APP_SECRET."""
+    from app.services.instagram_service import parse_meta_signed_request, generate_mock_signed_request
+    import hmac, hashlib, base64, json
+
+    # 1. Verify Settings alias
+    s = Settings(
+        META_CLIENT_SECRET="test_alias_secret_12345",
+        BACKEND_PUBLIC_URL="https://squash-dreadlock-diner.ngrok-free.dev",
+        META_APP_ID="3217043811838822"
+    )
+    assert s.META_APP_SECRET == "test_alias_secret_12345"
+    assert s.meta_client_secret == "test_alias_secret_12345"
+
+    # 2. Verify actual signed request verification uses META_APP_SECRET
+    user_id = "test_meta_user_998877"
+    valid_signed_req = generate_mock_signed_request(user_id=user_id)
+    payload = parse_meta_signed_request(valid_signed_req)
+    assert payload is not None
+    assert payload["user_id"] == user_id
+    assert payload["algorithm"] == "HMAC-SHA256"
+
+    # 3. Verify mismatch with a different secret is rejected
+    payload_data = {"user_id": user_id, "algorithm": "HMAC-SHA256", "issued_at": 1234567890}
+    payload_json = json.dumps(payload_data, separators=(",", ":"))
+    payload_b64 = base64.urlsafe_b64encode(payload_json.encode()).decode().rstrip("=")
+    wrong_sig = hmac.new(b"wrong_secret_key_value", payload_b64.encode(), hashlib.sha256).digest()
+    wrong_sig_b64 = base64.urlsafe_b64encode(wrong_sig).decode().rstrip("=")
+    wrong_signed_req = f"{wrong_sig_b64}.{payload_b64}"
+    assert parse_meta_signed_request(wrong_signed_req) is None
+
+
+def test_meta_data_deletion_comprehensive_cascade_and_retention(client, db_session, test_creator_user):
+    """Verify comprehensive deletion of all Instagram-derived records while preserving unrelated workspace data."""
+    from app.models.automation import Automation, AutomationLog
+    from app.models.analytics import CreatorAnalytics
+    from app.models.reel_intelligence import ReelAnalysisJob, ReelMetricSnapshot, ReelReport
+    from app.models.profile import CreatorProfile
+    from app.models.invoice import Invoice
+    from app.models.user import User, Workspace
+    import datetime as dt
+
+    user, ws = test_creator_user
+    ig_user_id = "ig_cascade_target_456"
+
+    # 1. Instagram Account
+    account = InstagramAccount(
+        workspace_id=ws.id,
+        ig_user_id=ig_user_id,
+        username="cascade_user",
+        encrypted_access_token="enc_token_xyz",
+        profile_pic_url="https://scontent.cdninstagram.com/avatar.jpg",
+        granted_permissions="instagram_business_basic,instagram_business_manage_insights",
+        followers_count=15200,
+        media_count=88,
+        is_connected=True
+    )
+    db_session.add(account)
+    db_session.flush()
+
+    # 2. Automation and logs
+    auto = Automation(
+        workspace_id=ws.id,
+        ig_account_id=account.id,
+        name="Auto Reply",
+        trigger_type="COMMENT",
+        is_active=True,
+        target_post_id="post_ig_123",
+        target_post_preview_url="https://scontent.cdninstagram.com/post.jpg",
+        dm_message_template="Thanks for your comment!"
+    )
+    db_session.add(auto)
+    db_session.flush()
+
+    log1 = AutomationLog(
+        automation_id=auto.id,
+        recipient_ig_id="recipient_ig_1",
+        recipient_username="fan_1",
+        trigger_comment_text="Love this!",
+        dm_text_sent="Thanks!"
+    )
+    log2 = AutomationLog(
+        automation_id=auto.id,
+        recipient_ig_id=ig_user_id,
+        recipient_username="cascade_user",
+        trigger_comment_text="Hello",
+        dm_text_sent="Welcome!"
+    )
+    db_session.add_all([log1, log2])
+
+    # 3. Creator Analytics (with audience insights and top posts)
+    analytics = CreatorAnalytics(
+        workspace_id=ws.id,
+        snapshot_date=dt.date.today(),
+        followers_count=15200,
+        media_count=88,
+        reach_30d=45000,
+        impressions_30d=60000,
+        avg_engagement_rate=4.5,
+        demographics_json='{"age": {"18-24": 40, "25-34": 50}}',
+        top_posts_json='[{"id": "post_1", "caption": "Reel 1"}]'
+    )
+    db_session.add(analytics)
+
+    # 4. Connected Reel Job and Snapshots
+    connected_job = ReelAnalysisJob(
+        workspace_id=ws.id,
+        analysis_mode="CONNECTED_ACCOUNT",
+        input_type="CONNECTED_POST",
+        source_media_id="media_ig_789",
+        status="COMPLETED"
+    )
+    db_session.add(connected_job)
+    db_session.flush()
+
+    connected_snapshot = ReelMetricSnapshot(
+        workspace_id=ws.id,
+        job_id=connected_job.id,
+        views_count=10000,
+        reach_count=8500,
+        impressions_count=9200,
+        likes_count=500
+    )
+    db_session.add(connected_snapshot)
+
+    connected_report = ReelReport(
+        workspace_id=ws.id,
+        job_id=connected_job.id,
+        title="Connected Reel",
+        analysis_mode="CONNECTED_ACCOUNT",
+        caption="Original Instagram Caption",
+        calculated_metrics_json='{"reach": 8500, "saves": 120}',
+        creative_quality_score=8.5,
+        performance_score=9.0,
+        growth_conversion_score=8.0,
+        viral_potential_estimate=8.2
+    )
+    db_session.add(connected_report)
+    db_session.flush()
+    connected_job.report_id = connected_report.id
+
+    # 5. Unrelated workspace records to preserve
+    profile = db_session.query(CreatorProfile).filter(CreatorProfile.workspace_id == ws.id).first()
+    if profile:
+        profile.avatar_url = "https://scontent.cdninstagram.com/profile.jpg"
+
+    invoice = Invoice(
+        workspace_id=ws.id,
+        invoice_number="INV-2026-001",
+        client_name="Test Sponsor",
+        client_email="sponsor@brand.com",
+        due_date=dt.date.today(),
+        total_amount=1500.0,
+        status="PAID"
+    )
+    db_session.add(invoice)
+
+    unrelated_job = ReelAnalysisJob(
+        workspace_id=ws.id,
+        analysis_mode="VIDEO_UPLOAD",
+        input_type="DIRECT_UPLOAD",
+        status="COMPLETED"
+    )
+    db_session.add(unrelated_job)
+
+    db_session.commit()
+
+    # Trigger actual data deletion callback
+    signed_req = generate_mock_signed_request(user_id=ig_user_id)
+    res = client.post("/api/v1/instagram/data-deletion", data={"signed_request": signed_req})
+    assert res.status_code == 200
+    code = res.json()["confirmation_code"]
+
+    # Verify Instagram Account is purged
+    db_session.refresh(account)
+    assert account.is_connected is False
+    assert account.encrypted_access_token == ""
+    assert account.profile_pic_url is None
+    assert account.granted_permissions == ""
+    assert account.followers_count == 0
+    assert account.media_count == 0
+
+    # Verify Automation is deactivated and logs deleted
+    db_session.refresh(auto)
+    assert auto.is_active is False
+    assert auto.target_post_id is None
+    assert auto.target_post_preview_url is None
+    remaining_logs = db_session.query(AutomationLog).filter(AutomationLog.automation_id == auto.id).count()
+    assert remaining_logs == 0
+
+    # Verify Creator Analytics audience insights & top posts are purged
+    db_session.refresh(analytics)
+    assert analytics.demographics_json is None
+    assert analytics.top_posts_json is None
+    assert analytics.reach_30d == 0
+    assert analytics.impressions_30d == 0
+
+    # Verify Connected Reel insights purged
+    db_session.refresh(connected_job)
+    assert connected_job.source_media_id is None
+    remaining_snapshots = db_session.query(ReelMetricSnapshot).filter(ReelMetricSnapshot.job_id == connected_job.id).count()
+    assert remaining_snapshots == 0
+    db_session.refresh(connected_report)
+    assert connected_report.caption is None
+    assert connected_report.calculated_metrics_json == "{}"
+
+    # Verify Instagram CDN avatar was purged
+    if profile:
+        db_session.refresh(profile)
+        assert profile.avatar_url is None
+
+    # Verify UNRELATED WORKSPACE DATA IS PRESERVED
+    assert db_session.query(Invoice).filter(Invoice.workspace_id == ws.id).count() == 1
+    assert db_session.query(ReelAnalysisJob).filter(ReelAnalysisJob.id == unrelated_job.id).count() == 1
+    assert db_session.query(User).filter(User.id == user.id).count() == 1
+    assert db_session.query(Workspace).filter(Workspace.id == ws.id).count() == 1
+
+
+def test_deletion_status_handles_failed_status(client, db_session):
+    """Verify /deletion-status handles FAILED status appropriately without hardcoded outputs."""
+    failed_record = InstagramDataDeletionRequest(
+        confirmation_code="woka_del_failed_test",
+        ig_user_id="ig_failed_user",
+        status="FAILED",
+        details="Meta Graph API rate limit encountered during automated profile teardown."
+    )
+    db_session.add(failed_record)
+    db_session.commit()
+
+    res = client.get("/api/v1/instagram/deletion-status?code=woka_del_failed_test")
+    assert res.status_code == 200
+    assert res.json()["status"] == "FAILED"
+    assert "rate limit" in res.json()["message"]

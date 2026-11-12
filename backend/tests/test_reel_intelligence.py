@@ -150,7 +150,7 @@ def test_api_submit_public_url_job_and_poll_status(client, auth_headers):
 def test_api_submit_connected_reel_and_fetch_report(client, auth_headers, db_session):
     """Integration test: submits a connected Reel, executes analysis, and retrieves full report."""
     payload = {
-        "media_id": "ig_reel_test_999",
+        "media_id": "ig_reel_ig_test_user_id_101",
         "title": "3 Pacing Secrets for Creators",
         "caption": "Why you need to cut breaths and dead air. Comment BLUEPRINT below!"
     }
@@ -182,8 +182,8 @@ def test_api_submit_connected_reel_and_fetch_report(client, auth_headers, db_ses
 def test_api_compare_reels(client, auth_headers, db_session):
     """Integration test: compares 2 completed Reel reports."""
     # Create two completed reports
-    job1_res = client.post("/api/v1/reel-intelligence/jobs/connected", json={"media_id": "reel_comp_1"}, headers=auth_headers)
-    job2_res = client.post("/api/v1/reel-intelligence/jobs/connected", json={"media_id": "reel_comp_2"}, headers=auth_headers)
+    job1_res = client.post("/api/v1/reel-intelligence/jobs/connected", json={"media_id": "ig_reel_ig_test_user_id_101"}, headers=auth_headers)
+    job2_res = client.post("/api/v1/reel-intelligence/jobs/connected", json={"media_id": "ig_reel_ig_test_user_id_102"}, headers=auth_headers)
     
     id1 = job1_res.json()["id"]
     id2 = job2_res.json()["id"]
@@ -602,7 +602,7 @@ def test_job_retry_rules(client, auth_headers):
     # Create and run a connected reel job to completion
     res = client.post(
         "/api/v1/reel-intelligence/jobs/connected",
-        json={"media_id": "reel_retry_test"},
+        json={"media_id": "ig_reel_ig_test_user_id_103"},
         headers=auth_headers
     )
     job_id = res.json()["id"]
@@ -634,8 +634,8 @@ def test_report_history_listing_and_filtering(client, auth_headers):
 def test_comparison_security_and_validation(client, auth_headers, db_session, test_creator_user):
     """Verifies bounds (2-5), duplicate detection, missing IDs, and cross-workspace isolation for comparisons."""
     # Create two valid reports for the current workspace
-    j1 = client.post("/api/v1/reel-intelligence/jobs/connected", json={"media_id": "comp_sec_1"}, headers=auth_headers)
-    j2 = client.post("/api/v1/reel-intelligence/jobs/connected", json={"media_id": "comp_sec_2"}, headers=auth_headers)
+    j1 = client.post("/api/v1/reel-intelligence/jobs/connected", json={"media_id": "sandbox_media_ig_test_user_id_1"}, headers=auth_headers)
+    j2 = client.post("/api/v1/reel-intelligence/jobs/connected", json={"media_id": "sandbox_media_ig_test_user_id_2"}, headers=auth_headers)
     r1_id = client.get(f"/api/v1/reel-intelligence/jobs/{j1.json()['id']}", headers=auth_headers).json()["report_id"]
     r2_id = client.get(f"/api/v1/reel-intelligence/jobs/{j2.json()['id']}", headers=auth_headers).json()["report_id"]
 
@@ -717,5 +717,748 @@ def test_ssrf_advanced_dns_and_metadata_blocking(client, auth_headers):
     for b_url in blocked_urls:
         res = client.post("/api/v1/reel-intelligence/jobs/url", json={"url": b_url}, headers=auth_headers)
         assert res.status_code == 422, f"Expected 422 for blocked URL '{b_url}', got {res.status_code}: {res.text}"
+
+
+def _sample_report_fields(title: str = "Initial Report", score: float = 72.5) -> dict:
+    return {
+        "title": title,
+        "analysis_mode": "PUBLIC_URL",
+        "thumbnail_url": "https://example.com/thumb.jpg",
+        "duration_seconds": 18.0,
+        "creative_quality_score": score,
+        "performance_score": score,
+        "growth_conversion_score": score,
+        "viral_potential_estimate": score,
+        "score_breakdown_json": "{}",
+        "calculated_metrics_json": "{}",
+        "video_intelligence_json": "{}",
+        "timeline_findings_json": "[]",
+        "prioritized_action_plan_json": "[]",
+        "creative_alternatives_json": "{}",
+        "provenance_json": "{}",
+    }
+
+
+def test_first_report_and_repeated_completed_job_reuses_report(client, auth_headers, db_session, test_creator_user, monkeypatch):
+    """
+    Verifies:
+    1. First submission creates exactly one ReelReport and marks the job COMPLETED with report_id.
+    2. Repeated URL submission and direct execute_reel_analysis() on a COMPLETED job reuse the
+       existing report without invoking the pipeline again or violating reel_reports_job_id_key.
+    """
+    import app.services.reel_intelligence_service as ris
+
+    _, workspace = test_creator_user
+    url = "https://www.instagram.com/reel/CReuseUnique1/"
+
+    first_res = client.post("/api/v1/reel-intelligence/jobs/url", json={"url": url}, headers=auth_headers)
+    assert first_res.status_code == 202
+    job_id = first_res.json()["id"]
+
+    poll1 = client.get(f"/api/v1/reel-intelligence/jobs/{job_id}", headers=auth_headers)
+    assert poll1.status_code == 200
+    assert poll1.json()["status"] == "COMPLETED"
+    report_id = poll1.json()["report_id"]
+    assert report_id is not None
+
+    reports = db_session.query(ReelReport).filter(ReelReport.job_id == job_id).all()
+    assert len(reports) == 1
+    assert reports[0].id == report_id
+
+    # Re-submitting the same URL must reuse the completed job/report without re-running analysis
+    pipeline_calls = {"count": 0}
+
+    def fail_if_reprocessed(*args, **kwargs):
+        pipeline_calls["count"] += 1
+        raise AssertionError("Completed job should reuse its existing report instead of re-processing")
+
+    monkeypatch.setattr(ris, "run_video_intelligence_pipeline", fail_if_reprocessed)
+
+    second_res = client.post("/api/v1/reel-intelligence/jobs/url", json={"url": url}, headers=auth_headers)
+    assert second_res.status_code == 202
+    assert second_res.json()["id"] == job_id
+    assert second_res.json()["status"] == "COMPLETED"
+    assert second_res.json()["report_id"] == report_id
+
+    # Polling after repeat submission confirms status stays COMPLETED and report count stays 1
+    poll2 = client.get(f"/api/v1/reel-intelligence/jobs/{job_id}", headers=auth_headers)
+    assert poll2.status_code == 200
+    assert poll2.json()["status"] == "COMPLETED"
+    assert poll2.json()["report_id"] == report_id
+    assert poll2.json()["error_message"] is None
+
+    # Direct execute_reel_analysis on COMPLETED job also reuses existing report cleanly
+    reused_report = ris.execute_reel_analysis(db_session, job_id, workspace_id=workspace.id)
+    assert reused_report.id == report_id
+    assert pipeline_calls["count"] == 0
+    assert db_session.query(ReelReport).filter(ReelReport.job_id == job_id).count() == 1
+
+
+def test_retry_after_failure_updates_existing_report_without_duplicate(client, auth_headers, db_session, test_creator_user, monkeypatch):
+    """
+    Simulates a job whose ReelReport already exists in the DB (e.g. failed before job finalization
+    or corrupted by prior state) and verifies retrying updates that report rather than inserting a duplicate.
+    """
+    import app.services.reel_intelligence_service as ris
+
+    _, workspace = test_creator_user
+    create_res = client.post(
+        "/api/v1/reel-intelligence/jobs/connected",
+        json={"media_id": "ig_reel_ig_test_user_id_102"},
+        headers=auth_headers,
+    )
+    assert create_res.status_code == 202
+    job_id = create_res.json()["id"]
+
+    job = db_session.query(ReelAnalysisJob).filter(ReelAnalysisJob.id == job_id).first()
+    existing_report = db_session.query(ReelReport).filter(ReelReport.job_id == job_id).first()
+    assert existing_report is not None
+    original_report_id = existing_report.id
+
+    # Mark existing report stale and put job in FAILED state (simulating failure after report persistence)
+    existing_report.title = "Stale Partial Report"
+    existing_report.creative_quality_score = 12.0
+    job.status = "FAILED"
+    job.error_message = "Transient downstream interruption"
+    job.report_id = None
+    db_session.commit()
+
+    # Retry via API
+    retry_res = client.post(f"/api/v1/reel-intelligence/jobs/{job_id}/retry", headers=auth_headers)
+    assert retry_res.status_code == 200
+
+    poll = client.get(f"/api/v1/reel-intelligence/jobs/{job_id}", headers=auth_headers)
+    assert poll.status_code == 200
+    assert poll.json()["status"] == "COMPLETED"
+    assert poll.json()["report_id"] == original_report_id
+    assert poll.json()["error_message"] is None
+
+    all_reports = db_session.query(ReelReport).filter(
+        ReelReport.job_id == job_id,
+        ReelReport.workspace_id == workspace.id,
+    ).all()
+    assert len(all_reports) == 1
+    assert all_reports[0].id == original_report_id
+    assert all_reports[0].title != "Stale Partial Report"
+    assert all_reports[0].creative_quality_score != 12.0
+
+    # Also verify direct upsert_reel_report_for_job updates in place when called directly
+    updated = ris.upsert_reel_report_for_job(
+        db_session,
+        job,
+        _sample_report_fields(title="Explicitly Refreshed Title", score=91.0),
+        workspace_id=workspace.id,
+    )
+    assert updated.id == original_report_id
+    assert updated.title == "Explicitly Refreshed Title"
+    assert updated.creative_quality_score == 91.0
+    assert db_session.query(ReelReport).filter(ReelReport.job_id == job_id).count() == 1
+
+
+def test_concurrent_unique_violation_recovery_and_multithread_persistence(tmp_path, db_session, test_creator_user, monkeypatch):
+    """
+    Tests:
+    1. PostgreSQL-style IntegrityError (pgcode 23505 on reel_reports_job_id_key) raised inside
+       SAVEPOINT when check-then-insert races with another worker recovers cleanly and updates
+       the single report instead of failing.
+    2. Real concurrent multi-threaded sessions persisting for the same job_id produce 1 report.
+    """
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    from sqlalchemy import create_engine
+    from sqlalchemy.exc import IntegrityError
+    from sqlalchemy.orm import sessionmaker
+    import app.services.reel_intelligence_service as ris
+    from app.database import Base
+
+    user, workspace = test_creator_user
+
+    # Part A: Simulate check-then-insert race hitting PostgreSQL UniqueViolation (pgcode 23505)
+    job = ReelAnalysisJob(
+        workspace_id=workspace.id,
+        analysis_mode="PUBLIC_URL",
+        input_type="url",
+        status="GENERATING_AI_REPORT",
+        source_url="https://www.instagram.com/reel/CRaceTest1/",
+    )
+    db_session.add(job)
+    db_session.flush()
+    preexisting = ReelReport(
+        workspace_id=workspace.id,
+        job_id=job.id,
+        **_sample_report_fields(title="Winning Worker Report", score=70.0),
+    )
+    db_session.add(preexisting)
+    db_session.commit()
+    winning_id = preexisting.id
+
+    orig_lookup = ris.get_job_report_for_workspace
+    lookup_state = {"calls": 0}
+
+    def stale_first_lookup(db, j_id, ws_id, for_update=False):
+        lookup_state["calls"] += 1
+        # Simulate another worker inserting between Worker B's initial check and INSERT
+        if lookup_state["calls"] == 1:
+            return None
+        return orig_lookup(db, j_id, ws_id, for_update=for_update)
+
+    monkeypatch.setattr(ris, "get_job_report_for_workspace", stale_first_lookup)
+
+    class _FakePgDiag:
+        constraint_name = "reel_reports_job_id_key"
+
+    class _FakePgOrig(Exception):
+        pgcode = "23505"
+        diag = _FakePgDiag()
+
+    orig_flush = db_session.flush
+    flush_state = {"injected": False}
+
+    def pg_unique_conflict_once(*args, **kwargs):
+        if not flush_state["injected"]:
+            flush_state["injected"] = True
+            raise IntegrityError(
+                "INSERT INTO reel_reports (...) VALUES (...)",
+                {},
+                _FakePgOrig('duplicate key value violates unique constraint "reel_reports_job_id_key"'),
+            )
+        return orig_flush(*args, **kwargs)
+
+    monkeypatch.setattr(db_session, "flush", pg_unique_conflict_once)
+
+    recovered = ris.upsert_reel_report_for_job(
+        db_session,
+        job,
+        _sample_report_fields(title="Racing Worker Updated Report", score=88.5),
+        workspace_id=workspace.id,
+    )
+    monkeypatch.setattr(ris, "get_job_report_for_workspace", orig_lookup)
+    monkeypatch.setattr(db_session, "flush", orig_flush)
+
+    assert recovered.id == winning_id
+    assert recovered.title == "Racing Worker Updated Report"
+    assert recovered.creative_quality_score == 88.5
+    db_session.refresh(job)
+    assert job.status == "COMPLETED"
+    assert job.report_id == winning_id
+    assert db_session.query(ReelReport).filter(ReelReport.job_id == job.id).count() == 1
+
+    # Part B: Real two-thread concurrent sessions against isolated file-backed SQLite DB
+    db_file = tmp_path / "concurrent_reports.db"
+    conc_engine = create_engine(
+        f"sqlite:///{db_file}",
+        connect_args={"check_same_thread": False, "timeout": 30},
+    )
+    Base.metadata.create_all(bind=conc_engine)
+    ConcSession = sessionmaker(autocommit=False, autoflush=False, bind=conc_engine)
+
+    seed_db = ConcSession()
+    seed_user = User(id="conc_u1", email="conc@woka.io", hashed_password=get_password_hash("Pass123!"), full_name="Conc User", role="CREATOR")
+    seed_ws = Workspace(id="conc_w1", name="Conc WS", owner_id="conc_u1")
+    seed_job = ReelAnalysisJob(
+        id="conc_job_1",
+        workspace_id="conc_w1",
+        analysis_mode="PUBLIC_URL",
+        input_type="url",
+        status="GENERATING_AI_REPORT",
+        source_url="https://www.instagram.com/reel/CConcurrent1/",
+    )
+    seed_db.add_all([seed_user, seed_ws, seed_job])
+    seed_db.commit()
+    seed_db.close()
+
+    barrier = threading.Barrier(2)
+
+    def run_worker(worker_idx: int) -> str:
+        w_db = ConcSession()
+        try:
+            w_job = w_db.query(ReelAnalysisJob).filter(ReelAnalysisJob.id == "conc_job_1").first()
+            barrier.wait(timeout=5)
+            rep = ris.upsert_reel_report_for_job(
+                w_db,
+                w_job,
+                _sample_report_fields(title=f"Worker {worker_idx} Report", score=80.0 + worker_idx),
+                workspace_id="conc_w1",
+            )
+            return rep.id
+        finally:
+            w_db.close()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        f1 = pool.submit(run_worker, 1)
+        f2 = pool.submit(run_worker, 2)
+        id1 = f1.result(timeout=15)
+        id2 = f2.result(timeout=15)
+
+    assert id1 == id2
+    verify_db = ConcSession()
+    try:
+        rows = verify_db.query(ReelReport).filter(ReelReport.job_id == "conc_job_1").all()
+        final_job = verify_db.query(ReelAnalysisJob).filter(ReelAnalysisJob.id == "conc_job_1").first()
+        assert len(rows) == 1
+        assert final_job.status == "COMPLETED"
+        assert final_job.report_id == rows[0].id
+    finally:
+        verify_db.close()
+        conc_engine.dispose()
+
+
+def test_cross_workspace_report_and_job_rejection(client, db_session, test_creator_user):
+    """Ensures cross-workspace access, retry, and report upsert/execution are strictly rejected."""
+    import app.services.reel_intelligence_service as ris
+
+    _, ws_a = test_creator_user
+
+    user_b = User(
+        email="cross_ws_b@other.io",
+        hashed_password=get_password_hash("OtherPass123!"),
+        full_name="User B",
+        role="CREATOR",
+    )
+    db_session.add(user_b)
+    db_session.flush()
+    ws_b = Workspace(name="Workspace B", owner_id=user_b.id)
+    db_session.add(ws_b)
+    db_session.flush()
+    db_session.add(WorkspaceMember(workspace_id=ws_b.id, user_id=user_b.id, role_in_workspace="OWNER"))
+    db_session.commit()
+
+    headers_a = {"Authorization": f"Bearer {create_access_token({'sub': test_creator_user[0].id, 'role': 'CREATOR', 'workspace_id': ws_a.id})}"}
+    headers_b = {"Authorization": f"Bearer {create_access_token({'sub': user_b.id, 'role': 'CREATOR', 'workspace_id': ws_b.id})}"}
+
+    submit_a = client.post(
+        "/api/v1/reel-intelligence/jobs/url",
+        json={"url": "https://www.instagram.com/reel/CCrossTenantGuard/"},
+        headers=headers_a,
+    )
+    assert submit_a.status_code == 202
+    job_a_id = submit_a.json()["id"]
+    job_a_detail = client.get(f"/api/v1/reel-intelligence/jobs/{job_a_id}", headers=headers_a).json()
+    report_a_id = job_a_detail["report_id"]
+
+    # Workspace B cannot view, retry, or fetch Workspace A's job/report
+    assert client.get(f"/api/v1/reel-intelligence/jobs/{job_a_id}", headers=headers_b).status_code == 404
+    assert client.post(f"/api/v1/reel-intelligence/jobs/{job_a_id}/retry", headers=headers_b).status_code == 404
+    assert client.get(f"/api/v1/reel-intelligence/reports/{report_a_id}", headers=headers_b).status_code == 404
+
+    # Service-layer calls with mismatched workspace_id must fail loudly and leave report untouched
+    job_a = db_session.query(ReelAnalysisJob).filter(ReelAnalysisJob.id == job_a_id).first()
+    with pytest.raises(PermissionError):
+        ris.execute_reel_analysis(db_session, job_a_id, workspace_id=ws_b.id)
+
+    with pytest.raises(PermissionError):
+        ris.upsert_reel_report_for_job(
+            db_session,
+            job_a,
+            _sample_report_fields(title="Cross Tenant Overwrite Attempt", score=1.0),
+            workspace_id=ws_b.id,
+        )
+
+    unchanged = db_session.query(ReelReport).filter(ReelReport.id == report_a_id).first()
+    assert unchanged.workspace_id == ws_a.id
+    assert unchanged.title != "Cross Tenant Overwrite Attempt"
+
+
+def test_raw_sql_exception_sanitized_in_job_error_and_logged(client, auth_headers, db_session, monkeypatch, caplog):
+    """
+    Ensures internal SQL/database exceptions during pipeline failure are logged with diagnostics
+    on the backend while returning a user-friendly message in job.error_message (no SQL leaks).
+    """
+    import logging
+    from sqlalchemy.exc import IntegrityError
+    import app.services.reel_intelligence_service as ris
+
+    def failing_upsert(*args, **kwargs):
+        raise IntegrityError(
+            "INSERT INTO reel_reports (id, workspace_id, job_id) VALUES (%s, %s, %s)",
+            {},
+            Exception('psycopg2.errors.UniqueViolation: duplicate key value violates unique constraint "reel_reports_job_id_key"'),
+        )
+
+    monkeypatch.setattr(ris, "upsert_reel_report_for_job", failing_upsert)
+
+    with caplog.at_level(logging.ERROR):
+        res = client.post(
+            "/api/v1/reel-intelligence/jobs/url",
+            json={"url": "https://www.instagram.com/reel/CSanitizeError1/"},
+            headers=auth_headers,
+        )
+    assert res.status_code == 202
+    job_id = res.json()["id"]
+
+    poll = client.get(f"/api/v1/reel-intelligence/jobs/{job_id}", headers=auth_headers)
+    assert poll.status_code == 200
+    body = poll.json()
+    assert body["status"] == "FAILED"
+    assert body["error_message"]
+    lower_err = body["error_message"].lower()
+    assert "psycopg2" not in lower_err
+    assert "reel_reports_job_id_key" not in lower_err
+    assert "insert into" not in lower_err
+    assert "[sql:" not in lower_err
+    assert "retry analysis" in lower_err
+    assert any("Reel analysis pipeline failed" in rec.message for rec in caplog.records)
+
+
+def test_missing_metrics_never_fabricated_and_retention_unclaimed(
+    client, auth_headers, test_creator_user, db_session, monkeypatch
+):
+    """
+    Ensures missing public/connected metrics remain None with category=UNAVAILABLE,
+    retention is never claimed measured without timestamped retention telemetry,
+    un-decoded streams do not fabricate duration/FPS/audio, and generic placeholder thumbnails are never used.
+    """
+    from app.models.instagram import InstagramAccount
+    import app.services.instagram_service as ig_svc
+
+    # Case A: Public URL submitted with no creator-declared metrics
+    url_res = client.post(
+        "/api/v1/reel-intelligence/jobs/url",
+        json={"url": "https://www.instagram.com/reel/C_missing_metrics_test/"},
+        headers=auth_headers,
+    )
+    assert url_res.status_code == 202
+    url_job = client.get(f"/api/v1/reel-intelligence/jobs/{url_res.json()['id']}", headers=auth_headers).json()
+    assert url_job["status"] == "COMPLETED"
+
+    url_report = client.get(
+        f"/api/v1/reel-intelligence/reports/{url_job['report_id']}",
+        headers=auth_headers,
+    ).json()
+
+    for key in ["views", "likes", "comments", "shares", "saves", "reach", "engagement_rate", "watch_ratio"]:
+        metric = url_report["calculated_metrics"][key]
+        assert metric["value"] is None, f"Expected {key} to be None, got {metric['value']}"
+        assert metric["category"] == "UNAVAILABLE"
+        assert metric["is_simulated"] is False
+
+    assert url_report["duration_seconds"] == 0.0
+    assert url_report["thumbnail_url"] is None
+    assert url_report["provenance"]["duration_measured"] is False
+    assert url_report["provenance"]["fps_measured"] is False
+    assert url_report["provenance"]["video_stream_analyzed"] is False
+    assert url_report["provenance"]["audio_speech_analyzed"] is False
+    assert url_report["provenance"]["caption_analyzed"] is False
+    assert url_report["provenance"]["is_retention_measured"] is False
+    assert url_report["scores"]["creative_quality"]["data_available"] is False
+    assert url_report["scores"]["performance"]["data_available"] is False
+    assert url_report["scores"]["performance"]["rating"] == "UNAVAILABLE"
+    assert url_report["scores"]["growth_conversion"]["data_available"] is False
+    assert url_report["scores"]["growth_conversion"]["rating"] == "UNAVAILABLE"
+    assert url_report["scores"]["viral_potential"]["data_available"] is False
+    assert url_report["scores"]["growth_conversion"]["rating"] == "UNAVAILABLE"
+
+    # Case B: Live connected Reel where Meta omits views, like_count, comments_count, avg_watch_time, and thumbnail_url
+    _, ws = test_creator_user
+    account = db_session.query(InstagramAccount).filter(InstagramAccount.workspace_id == ws.id).first()
+    account.is_sandbox = False
+    db_session.commit()
+
+    partial_media = {
+        "id": "ig_live_partial_1",
+        "media_type": "VIDEO",
+        "media_product_type": "REELS",
+        "caption": "Budget meal prep grocery list for busy weeknights",
+        "permalink": "https://www.instagram.com/reel/C_partial_1/",
+    }
+    monkeypatch.setattr(ig_svc, "fetch_instagram_media_by_id", lambda *args, **kwargs: dict(partial_media))
+    monkeypatch.setattr(ig_svc, "fetch_instagram_media_list", lambda *args, **kwargs: [dict(partial_media)])
+    monkeypatch.setattr(
+        ig_svc,
+        "fetch_media_insights",
+        lambda *args, **kwargs: {"reach": 2500, "saved": 40, "shares": 15},
+    )
+
+    conn_res = client.post(
+        "/api/v1/reel-intelligence/jobs/connected",
+        json={"media_id": "ig_live_partial_1"},
+        headers=auth_headers,
+    )
+    assert conn_res.status_code == 202
+    conn_job = client.get(f"/api/v1/reel-intelligence/jobs/{conn_res.json()['id']}", headers=auth_headers).json()
+    assert conn_job["status"] == "COMPLETED"
+
+    conn_report = client.get(
+        f"/api/v1/reel-intelligence/reports/{conn_job['report_id']}",
+        headers=auth_headers,
+    ).json()
+    cm = conn_report["calculated_metrics"]
+    assert cm["views"]["value"] is None and cm["views"]["category"] == "UNAVAILABLE"
+    assert cm["likes"]["value"] is None and cm["likes"]["category"] == "UNAVAILABLE"
+    assert cm["comments"]["value"] is None and cm["comments"]["category"] == "UNAVAILABLE"
+    assert cm["watch_ratio"]["value"] is None and cm["watch_ratio"]["category"] == "UNAVAILABLE"
+    assert cm["reach"]["value"] == 2500.0 and cm["reach"]["category"] == "MEASURED"
+    assert cm["saves"]["value"] == 40.0 and cm["saves"]["category"] == "MEASURED"
+    assert cm["shares"]["value"] == 15.0 and cm["shares"]["category"] == "MEASURED"
+    assert conn_report["thumbnail_url"] is None
+    assert conn_report["provenance"]["is_retention_measured"] is False
+    assert conn_report["provenance"]["is_simulated"] is False
+
+    # History summary also exposes missing counts honestly
+    history = client.get("/api/v1/reel-intelligence/reports", headers=auth_headers).json()
+    conn_summary = next(item for item in history if item["id"] == conn_report["id"])
+    assert conn_summary["views_count"] is None
+    assert conn_summary["likes_count"] is None
+    assert conn_summary["duration_measured"] is False
+    assert conn_summary["is_simulated"] is False
+
+
+def test_sandbox_simulated_data_is_visibly_labeled_and_not_live_meta(client, auth_headers):
+    """
+    Verifies sandbox/demo connected Reels are explicitly flagged as simulated across
+    /connected-reels, report metrics, provenance, and /reports summaries, and never use
+    Meta Graph API labels or unsplash placeholder URLs.
+    """
+    reels_res = client.get("/api/v1/reel-intelligence/connected-reels", headers=auth_headers)
+    assert reels_res.status_code == 200
+    payload = reels_res.json()
+    assert payload["has_connected_account"] is True
+    assert payload["is_sandbox"] is True
+    assert len(payload["reels"]) >= 1
+
+    first_reel = payload["reels"][0]
+    assert first_reel["is_simulated"] is True
+    assert first_reel["data_source"] == "SANDBOX_SIMULATION"
+    assert "unsplash.com" not in (first_reel.get("thumbnail_url") or "")
+
+    job_res = client.post(
+        "/api/v1/reel-intelligence/jobs/connected",
+        json={
+            "media_id": first_reel["media_id"],
+            "title": first_reel["title"],
+            "caption": first_reel["caption"],
+        },
+        headers=auth_headers,
+    )
+    assert job_res.status_code == 202
+    job_body = client.get(f"/api/v1/reel-intelligence/jobs/{job_res.json()['id']}", headers=auth_headers).json()
+    assert job_body["status"] == "COMPLETED"
+
+    report = client.get(f"/api/v1/reel-intelligence/reports/{job_body['report_id']}", headers=auth_headers).json()
+    assert report["provenance"]["is_simulated"] is True
+    assert report["provenance"]["metric_source_mode"] == "SANDBOX_SIMULATION"
+    assert any("sandbox" in lim.lower() or "simulated" in lim.lower() for lim in report["provenance"]["limitations"])
+
+    for metric_key in ["views", "likes", "comments", "shares", "saves", "reach", "engagement_rate"]:
+        metric = report["calculated_metrics"][metric_key]
+        assert metric["category"] == "SIMULATED"
+        assert metric["is_simulated"] is True
+        assert "Sandbox Simulation" in metric["source"]
+        assert not metric["source"].startswith("Meta Graph API")
+
+    history = client.get("/api/v1/reel-intelligence/reports", headers=auth_headers).json()
+    summary = next(item for item in history if item["id"] == report["id"])
+    assert summary["is_simulated"] is True
+    assert summary["metric_source"] == "SANDBOX_SIMULATION"
+
+
+def test_uploaded_video_derives_real_opencv_frames_and_reel_specific_diagnosis(client, auth_headers, tmp_path):
+    """
+    Uploads a real OpenCV-encoded 9:16 video with a mid-video visual cut and verifies that
+    duration, FPS, resolution, frame telemetry, cover thumbnail, timeline timestamps, and
+    Reel-specific diagnosis originate from the real uploaded video without generic boilerplate.
+    """
+    import cv2
+    import numpy as np
+
+    video_path = tmp_path / "baking_sourdough_tips.mp4"
+    width, height, fps = 540, 960, 10.0
+    writer = cv2.VideoWriter(str(video_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+    assert writer.isOpened(), "OpenCV VideoWriter failed to open mp4v file"
+
+    try:
+        for idx in range(30):
+            frame = np.zeros((height, width, 3), dtype=np.uint8)
+            if idx < 15:
+                frame[:, :] = (35, 45, 165)
+                cv2.rectangle(frame, (80, 320), (460, 620), (200, 220, 240), -1)
+            else:
+                frame[:, :] = (210, 200, 70)
+                # Place high-contrast overlay rectangle in lower Instagram Reel UI zone
+                cv2.rectangle(frame, (40, 760), (500, 910), (255, 255, 255), -1)
+            writer.write(frame)
+    finally:
+        writer.release()
+
+    with open(video_path, "rb") as fh:
+        up_res = client.post(
+            "/api/v1/reel-intelligence/jobs/upload",
+            files={"file": ("baking_sourdough_tips.mp4", fh, "video/mp4")},
+            headers=auth_headers,
+        )
+    assert up_res.status_code == 202
+    job_body = client.get(f"/api/v1/reel-intelligence/jobs/{up_res.json()['id']}", headers=auth_headers).json()
+    assert job_body["status"] == "COMPLETED"
+
+    report = client.get(f"/api/v1/reel-intelligence/reports/{job_body['report_id']}", headers=auth_headers).json()
+    vi_meta = report["video_intelligence"]["metadata"]
+    vi_frames = report["video_intelligence"]["frame_telemetry"]
+
+    assert 2.5 <= report["duration_seconds"] <= 3.5
+    assert 9.0 <= vi_meta["fps"] <= 11.0
+    assert vi_meta["resolution"] == "540x960"
+    assert vi_meta["aspect_ratio"] == "9:16"
+    assert vi_meta["video_stream_analyzed"] is True
+    assert len(vi_frames["frame_observations"]) >= 3
+    assert report["provenance"]["duration_measured"] is True
+    assert report["provenance"]["fps_measured"] is True
+    assert report["provenance"]["video_stream_analyzed"] is True
+    assert report["provenance"]["audio_speech_analyzed"] is False
+
+    # Cover frame thumbnail is real extracted JPEG and serves cleanly
+    assert report["thumbnail_url"] and report["thumbnail_url"].startswith("/api/v1/reel-intelligence/thumbnails/")
+    thumb_res = client.get(report["thumbnail_url"])
+    assert thumb_res.status_code == 200
+    assert thumb_res.headers["content-type"].startswith("image/jpeg")
+
+    # Creative quality score is available from real frames, while post-publish metrics remain UNAVAILABLE
+    assert report["scores"]["creative_quality"]["data_available"] is True
+    assert report["scores"]["performance"]["data_available"] is False
+    assert report["scores"]["growth_conversion"]["data_available"] is False
+    assert report["calculated_metrics"]["views"]["category"] == "UNAVAILABLE"
+
+    # Timeline findings must stay within the real ~3s duration (no fabricated 14s/45s timestamps)
+    for finding in report["timeline_findings"]:
+        assert finding["timestamp_end_seconds"] <= report["duration_seconds"] + 0.5
+        assert finding["source"]
+        assert finding["limitations"]
+
+    # Creative output reflects actual video filename/topic instead of hardcoded generic prompts
+    hook_texts = [h.get("hook_text", "") for h in report["creative_alternatives"].get("alternative_hooks", [])]
+    caption_texts = [c.get("text", "") for c in report["creative_alternatives"].get("caption_suggestions", [])]
+    action_texts = [
+        f"{a.get('area', '')} {a.get('what_to_change', '')} {a.get('how_to_implement', '')}"
+        for a in report["prioritized_action_plan"]
+    ]
+    combined_creative_text = " ".join(hook_texts + caption_texts + action_texts).lower()
+    assert "baking" in combined_creative_text or "sourdough" in combined_creative_text
+    assert "hidden instagram setting for 14 days" not in combined_creative_text
+    assert "comment 'scale'" not in combined_creative_text
+
+
+def test_source_mapping_accuracy_and_unsupported_claims_rejected(
+    client, auth_headers, test_creator_user, db_session, monkeypatch
+):
+    """
+    Verifies MEASURED vs CALCULATED vs UNAVAILABLE source mappings for a live connected Reel,
+    preservation of genuine CDN thumbnails, rejection of unmeasured retention claims when only
+    average watch time exists, and data-driven compare takeaways without canned multipliers.
+    """
+    from app.models.instagram import InstagramAccount
+    import app.services.instagram_service as ig_svc
+
+    _, ws = test_creator_user
+    account = db_session.query(InstagramAccount).filter(InstagramAccount.workspace_id == ws.id).first()
+    account.is_sandbox = False
+    db_session.commit()
+
+    media_catalog = {
+        "ig_coffee_1": {
+            "id": "ig_coffee_1",
+            "media_type": "VIDEO",
+            "media_product_type": "REELS",
+            "caption": "Cold brew coffee extraction ratio for smooth mornings. Save this recipe!",
+            "like_count": 320,
+            "comments_count": 14,
+            "thumbnail_url": "https://scontent.cdninstagram.com/coffee_thumb.jpg",
+            "permalink": "https://www.instagram.com/reel/C_coffee_1/",
+        },
+        "ig_fitness_2": {
+            "id": "ig_fitness_2",
+            "media_type": "VIDEO",
+            "media_product_type": "REELS",
+            "caption": "Mobility warm-up routine for runners before race day.",
+            "like_count": 90,
+            "comments_count": 4,
+            "thumbnail_url": "https://scontent.cdninstagram.com/fitness_thumb.jpg",
+            "permalink": "https://www.instagram.com/reel/C_fitness_2/",
+        },
+    }
+    insights_catalog = {
+        "ig_coffee_1": {
+            "views": 8000,
+            "reach": 6400,
+            "saved": 180,
+            "shares": 45,
+            "ig_reels_avg_watch_time": 11.0,
+        },
+        "ig_fitness_2": {
+            "views": 2500,
+            "reach": 2100,
+            "saved": 30,
+            "shares": 10,
+        },
+    }
+
+    monkeypatch.setattr(
+        ig_svc,
+        "fetch_instagram_media_by_id",
+        lambda *args, **kwargs: dict(media_catalog[kwargs.get("media_id") if "media_id" in kwargs else args[1]]),
+    )
+    monkeypatch.setattr(
+        ig_svc,
+        "fetch_instagram_media_list",
+        lambda *args, **kwargs: [dict(m) for m in media_catalog.values()],
+    )
+    monkeypatch.setattr(
+        ig_svc,
+        "fetch_media_insights",
+        lambda *args, **kwargs: dict(insights_catalog[kwargs.get("media_id") if "media_id" in kwargs else args[1]]),
+    )
+
+    report_ids = []
+    for mid in ["ig_coffee_1", "ig_fitness_2"]:
+        res = client.post(
+            "/api/v1/reel-intelligence/jobs/connected",
+            json={"media_id": mid},
+            headers=auth_headers,
+        )
+        assert res.status_code == 202
+        job = client.get(f"/api/v1/reel-intelligence/jobs/{res.json()['id']}", headers=auth_headers).json()
+        assert job["status"] == "COMPLETED"
+        report_ids.append(job["report_id"])
+
+    coffee_report = client.get(
+        f"/api/v1/reel-intelligence/reports/{report_ids[0]}",
+        headers=auth_headers,
+    ).json()
+
+    assert coffee_report["thumbnail_url"] == "https://scontent.cdninstagram.com/coffee_thumb.jpg"
+    cm = coffee_report["calculated_metrics"]
+    assert cm["views"]["value"] == 8000.0 and cm["views"]["category"] == "MEASURED"
+    assert cm["likes"]["value"] == 320.0 and cm["likes"]["category"] == "MEASURED"
+    assert cm["comments"]["value"] == 14.0 and cm["comments"]["category"] == "MEASURED"
+    assert cm["saves"]["value"] == 180.0 and cm["saves"]["category"] == "MEASURED"
+    assert cm["shares"]["value"] == 45.0 and cm["shares"]["category"] == "MEASURED"
+    assert cm["reach"]["value"] == 6400.0 and cm["reach"]["category"] == "MEASURED"
+    assert cm["engagement_rate"]["category"] == "CALCULATED"
+    assert cm["watch_ratio"]["category"] == "UNAVAILABLE"
+
+    assert coffee_report["provenance"]["is_retention_measured"] is False
+    assert coffee_report["provenance"]["video_stream_analyzed"] is False
+    assert coffee_report["provenance"]["audio_speech_analyzed"] is False
+    assert coffee_report["provenance"]["caption_analyzed"] is True
+
+    coffee_text = " ".join(
+        [h.get("hook_text", "") for h in coffee_report["creative_alternatives"].get("alternative_hooks", [])]
+        + [c.get("text", "") for c in coffee_report["creative_alternatives"].get("caption_suggestions", [])]
+    ).lower()
+    assert "coffee" in coffee_text or "brew" in coffee_text or "extraction" in coffee_text
+    assert "comment 'scale'" not in coffee_text
+
+    # Compare the two reports and ensure comparison takeaways are grounded in real report numbers
+    comp_res = client.post(
+        "/api/v1/reel-intelligence/compare",
+        json={"report_ids": report_ids},
+        headers=auth_headers,
+    )
+    assert comp_res.status_code == 200
+    comp_body = comp_res.json()
+    assert comp_body["winner_id"] == report_ids[0]
+    takeaways_joined = " ".join(comp_body["comparative_takeaways"])
+    assert "3.4x higher comment density" not in takeaways_joined
+    assert "8.73%" in takeaways_joined
+    assert "engagement rate" in takeaways_joined.lower()
+
 
 

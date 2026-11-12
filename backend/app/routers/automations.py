@@ -4,19 +4,18 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.models.user import User
+from app.models.user import Workspace
 from app.schemas.automation import (
     AutomationCreate, AutomationUpdate, AutomationResponse,
     AutomationSimulateRequest, AutomationSimulateResponse,
     AutomationLogResponse
 )
-from app.services.auth_service import get_or_create_workspace
 from app.services.automation_engine import (
     list_automations, get_automation, create_automation,
     update_automation, delete_automation, simulate_trigger,
     list_automation_logs
 )
-from app.security import get_current_user
+from app.security import get_active_workspace
 
 router = APIRouter(prefix="/automations", tags=["Instagram Automation"])
 
@@ -46,20 +45,17 @@ def to_automation_response(auto) -> AutomationResponse:
     )
 
 @router.get("", response_model=List[AutomationResponse])
-def get_all_automations(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    workspace = get_or_create_workspace(db, current_user)
+def get_all_automations(workspace: Workspace = Depends(get_active_workspace), db: Session = Depends(get_db)):
     autos = list_automations(db, workspace.id)
     return [to_automation_response(a) for a in autos]
 
 @router.post("", response_model=AutomationResponse, status_code=status.HTTP_201_CREATED)
-def create_new_automation(payload: AutomationCreate, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    workspace = get_or_create_workspace(db, current_user)
+def create_new_automation(payload: AutomationCreate, workspace: Workspace = Depends(get_active_workspace), db: Session = Depends(get_db)):
     auto = create_automation(db, workspace.id, payload)
     return to_automation_response(auto)
 
 @router.get("/logs", response_model=List[AutomationLogResponse])
-def get_logs(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    workspace = get_or_create_workspace(db, current_user)
+def get_logs(workspace: Workspace = Depends(get_active_workspace), db: Session = Depends(get_db)):
     logs = list_automation_logs(db, workspace.id)
     return [
         AutomationLogResponse(
@@ -79,24 +75,20 @@ def get_logs(current_user: User = Depends(get_current_user), db: Session = Depen
     ]
 
 @router.post("/simulate", response_model=AutomationSimulateResponse)
-def simulate_comment_flow(payload: AutomationSimulateRequest, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    workspace = get_or_create_workspace(db, current_user)
+def simulate_comment_flow(payload: AutomationSimulateRequest, workspace: Workspace = Depends(get_active_workspace), db: Session = Depends(get_db)):
     return simulate_trigger(db, workspace.id, payload)
 
 @router.get("/{automation_id}", response_model=AutomationResponse)
-def get_single_automation(automation_id: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    workspace = get_or_create_workspace(db, current_user)
+def get_single_automation(automation_id: str, workspace: Workspace = Depends(get_active_workspace), db: Session = Depends(get_db)):
     auto = get_automation(db, workspace.id, automation_id)
     return to_automation_response(auto)
 
 @router.put("/{automation_id}", response_model=AutomationResponse)
-def edit_automation(automation_id: str, payload: AutomationUpdate, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    workspace = get_or_create_workspace(db, current_user)
+def edit_automation(automation_id: str, payload: AutomationUpdate, workspace: Workspace = Depends(get_active_workspace), db: Session = Depends(get_db)):
     auto = update_automation(db, workspace.id, automation_id, payload)
     return to_automation_response(auto)
 
 @router.delete("/{automation_id}")
-def remove_automation(automation_id: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    workspace = get_or_create_workspace(db, current_user)
+def remove_automation(automation_id: str, workspace: Workspace = Depends(get_active_workspace), db: Session = Depends(get_db)):
     delete_automation(db, workspace.id, automation_id)
     return {"status": "DELETED"}

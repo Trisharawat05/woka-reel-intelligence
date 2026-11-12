@@ -915,6 +915,311 @@ def get_connected_account(db: Session, workspace_id: str) -> Optional[InstagramA
     ).first()
 
 
+def get_sandbox_media_catalog(ig_user_id: str, include_non_video: bool = False) -> List[Dict[str, Any]]:
+    """Returns deterministic sandbox media catalog scoped strictly to the account's ig_user_id."""
+    items: List[Dict[str, Any]] = [
+        {
+            "id": f"ig_reel_{ig_user_id}_101",
+            "title": "3 Hook Mistakes That Kill Your Retention",
+            "caption": "Stop starting your Reels with a generic 3-second logo intro. Here's what to do instead. Comment REEL for the checklist! 👇",
+            "media_type": "VIDEO",
+            "media_product_type": "REELS",
+            "thumbnail_url": "",
+            "media_url": "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4",
+            "permalink": f"https://www.instagram.com/reel/C_demo_{ig_user_id}_101/",
+            "views": 48200,
+            "likes": 3120,
+            "comments": 240,
+            "timestamp": "2026-10-12T14:30:00Z",
+            "is_simulated": True,
+        },
+        {
+            "id": f"ig_reel_{ig_user_id}_102",
+            "title": "The 140 WPM Sweet Spot for Spoken Pacing",
+            "caption": "Why rapid-fire delivery without pauses keeps viewers watching until the very end. Save this before recording!",
+            "media_type": "VIDEO",
+            "media_product_type": "REELS",
+            "thumbnail_url": "",
+            "media_url": "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerEscapes.mp4",
+            "permalink": f"https://www.instagram.com/reel/C_demo_{ig_user_id}_102/",
+            "views": 22100,
+            "likes": 1420,
+            "comments": 88,
+            "timestamp": "2026-10-08T09:15:00Z",
+            "is_simulated": True,
+        },
+        {
+            "id": f"ig_reel_{ig_user_id}_103",
+            "title": "Safe Zones: Don't Let Instagram Hide Your Subtitles",
+            "caption": "If your captions sit in the bottom 20%, half your audience can't read them. Here is the certified safe template.",
+            "media_type": "VIDEO",
+            "media_product_type": "REELS",
+            "thumbnail_url": "",
+            "media_url": "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerFun.mp4",
+            "permalink": f"https://www.instagram.com/reel/C_demo_{ig_user_id}_103/",
+            "views": 16900,
+            "likes": 980,
+            "comments": 64,
+            "timestamp": "2026-10-02T18:45:00Z",
+            "is_simulated": True,
+        },
+        {
+            "id": f"sandbox_media_{ig_user_id}_1",
+            "title": "Sandbox Reel: 3 Hook Mistakes That Kill Your Retention",
+            "caption": "Sandbox Reel: 3 Hook Mistakes That Kill Your Retention",
+            "media_type": "VIDEO",
+            "media_product_type": "REELS",
+            "thumbnail_url": "",
+            "media_url": "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4",
+            "permalink": f"https://www.instagram.com/reel/C_demo_{ig_user_id}_1/",
+            "views": 48200,
+            "likes": 3120,
+            "comments": 240,
+            "timestamp": "2026-10-12T14:30:00+0000",
+            "is_simulated": True,
+        },
+        {
+            "id": f"sandbox_media_{ig_user_id}_2",
+            "title": "Sandbox Reel: The 140 WPM Sweet Spot for Spoken Pacing",
+            "caption": "Sandbox Reel: The 140 WPM Sweet Spot for Spoken Pacing",
+            "media_type": "VIDEO",
+            "media_product_type": "REELS",
+            "thumbnail_url": "",
+            "media_url": "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerEscapes.mp4",
+            "permalink": f"https://www.instagram.com/reel/C_demo_{ig_user_id}_2/",
+            "views": 22100,
+            "likes": 1420,
+            "comments": 88,
+            "timestamp": "2026-10-10T18:15:00+0000",
+            "is_simulated": True,
+        },
+    ]
+    if include_non_video:
+        items.append({
+            "id": f"ig_image_{ig_user_id}_201",
+            "title": "Carousel Cover Graphic",
+            "caption": "Static feed image post",
+            "media_type": "IMAGE",
+            "media_product_type": "FEED",
+            "thumbnail_url": "",
+            "media_url": "",
+            "permalink": f"https://www.instagram.com/p/C_demo_img_{ig_user_id}_201/",
+            "views": 0,
+            "likes": 510,
+            "comments": 24,
+            "timestamp": "2026-10-01T12:00:00Z",
+        })
+    return items
+
+
+def fetch_instagram_media_by_id(access_token: str, media_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Targeted single-media Graph API lookup (GET /{media_id}) to support accounts with >150 items
+    and distinguish inaccessible media (permission denied) from nonexistent media (404).
+    """
+    clean_media_id = (media_id or "").strip()
+    if not clean_media_id or not re.fullmatch(r"[A-Za-z0-9._-]+", clean_media_id):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Invalid Instagram media_id format."
+        )
+
+    target_url = f"{settings.INSTAGRAM_GRAPH_HOST}/{settings.META_API_VERSION}/{clean_media_id}"
+    field_candidates = [
+        f"{VERIFIED_INSTAGRAM_MEDIA_FIELDS},thumbnail_url,media_product_type,like_count,comments_count,username,owner",
+        f"{VERIFIED_INSTAGRAM_MEDIA_FIELDS},thumbnail_url,media_product_type,username,owner",
+        f"{VERIFIED_INSTAGRAM_MEDIA_FIELDS},thumbnail_url,media_product_type,username",
+        f"{VERIFIED_INSTAGRAM_MEDIA_FIELDS},username",
+        VERIFIED_INSTAGRAM_MEDIA_FIELDS,
+    ]
+
+    for query_fields in field_candidates:
+        params = {"fields": query_fields, "access_token": access_token}
+        resp = _request_with_retry("GET", target_url, params=params)
+        if resp.status_code == 200:
+            item = resp.json()
+            normalized: Dict[str, Any] = {
+                "id": str(item.get("id", clean_media_id)),
+                "caption": item.get("caption") or "",
+                "media_type": str(item.get("media_type", "UNKNOWN")),
+                "media_url": item.get("media_url") or "",
+                "permalink": item.get("permalink") or "",
+                "timestamp": item.get("timestamp") or "",
+            }
+            for opt_key in ("thumbnail_url", "media_product_type", "like_count", "comments_count", "username", "owner", "owner_id"):
+                if opt_key in item:
+                    normalized[opt_key] = item[opt_key]
+            return normalized
+
+        err_data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+        err_obj = err_data.get("error", {})
+        err_msg = err_obj.get("message") or resp.text
+        err_code = err_obj.get("code")
+        err_subcode = err_obj.get("error_subcode")
+
+        if err_code in [190, 102]:
+            raise MetaTokenExpiredError(
+                f"Instagram access token expired or revoked (Meta error {err_code}): {err_msg}",
+                code=err_code,
+                subcode=err_subcode,
+            )
+        if resp.status_code == 403 or err_code in [10, 200] or "permission" in err_msg.lower():
+            raise MetaPermissionError(
+                f"Permission denied accessing Instagram media (Meta error {err_code}): {err_msg}",
+                code=err_code,
+                subcode=err_subcode,
+            )
+        if resp.status_code == 429 or err_code in [4, 17, 32, 613] or "rate limit" in err_msg.lower():
+            raise MetaRateLimitError(
+                f"Meta Graph API rate limit exceeded (Meta error {err_code}): {err_msg}",
+                code=err_code,
+                subcode=err_subcode,
+            )
+        if err_code == 100:
+            if "nonexisting field" in err_msg.lower() or "tried accessing nonexisting field" in err_msg.lower():
+                continue
+            # Nonexistent media object / unsupported get request
+            return None
+        if resp.status_code == 404:
+            return None
+
+        raise MetaAPIError(
+            f"Failed to fetch Instagram media {clean_media_id} (status {resp.status_code}, error {err_code}): {err_msg}",
+            code=err_code,
+            subcode=err_subcode,
+        )
+
+    return None
+
+
+def _verify_media_record_owner(
+    item: Dict[str, Any],
+    account: InstagramAccount,
+    require_explicit_owner: bool,
+) -> None:
+    """
+    Prevents false acceptance of media belonging to another Instagram account.
+    Rejects explicit mismatches and denies-by-default on targeted lookups lacking owner proof.
+    """
+    owner_obj = item.get("owner")
+    owner_id = owner_obj.get("id") if isinstance(owner_obj, dict) else item.get("owner_id")
+    item_username = str(item.get("username") or "").strip().lower()
+    acct_ig_id = str(account.ig_user_id or "").strip()
+    acct_username = str(account.username or "").strip().lower()
+
+    if owner_id is not None and str(owner_id).strip() and str(owner_id).strip() != acct_ig_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Requested media belongs to a different Instagram account.",
+        )
+
+    if item_username and acct_username and item_username != acct_username:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Requested media belongs to a different Instagram account.",
+        )
+
+    if require_explicit_owner:
+        owner_id_confirmed = owner_id is not None and str(owner_id).strip() == acct_ig_id
+        username_confirmed = bool(item_username and acct_username and item_username == acct_username)
+        if not owner_id_confirmed and not username_confirmed:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Unable to verify ownership of the requested Instagram media for the connected account.",
+            )
+
+
+def verify_connected_account_media_ownership(
+    db: Session,
+    account: Optional[InstagramAccount],
+    media_id: str,
+    require_video_or_reel: bool = False,
+) -> Dict[str, Any]:
+    """
+    Verifies that media_id belongs to the workspace's connected Instagram account
+    and returns authoritative media metadata from the integration (never client-supplied values).
+    Supports both paginated account media lists and targeted lookup with strict owner verification.
+    """
+    clean_media_id = (media_id or "").strip()
+    if not clean_media_id or not re.fullmatch(r"[A-Za-z0-9._-]+", clean_media_id):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="A valid Instagram media_id must be provided."
+        )
+
+    if not account or not account.is_connected:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No connected Instagram professional account found for this workspace."
+        )
+
+    matched_item: Optional[Dict[str, Any]] = None
+
+    if account.is_sandbox:
+        candidates = get_sandbox_media_catalog(account.ig_user_id, include_non_video=True)
+        matched_item = next((item for item in candidates if str(item.get("id", "")) == clean_media_id), None)
+        if not matched_item:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Requested media ID was not found on the connected Instagram account."
+            )
+    else:
+        plain_token = decrypt_token(account.encrypted_access_token)
+        if not plain_token:
+            account.is_connected = False
+            db.commit()
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Instagram access token is missing or corrupted. Please reconnect."
+            )
+        try:
+            candidates = fetch_instagram_media_list(
+                access_token=plain_token,
+                user_id=account.ig_user_id,
+                limit=50,
+                max_pages=3,
+            )
+            matched_item = next((item for item in candidates if str(item.get("id", "")) == clean_media_id), None)
+            if matched_item:
+                _verify_media_record_owner(matched_item, account, require_explicit_owner=False)
+            else:
+                # Targeted lookup handles accounts with >150 media items while strictly verifying owner identity
+                targeted_item = fetch_instagram_media_by_id(plain_token, clean_media_id)
+                if not targeted_item:
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail="Requested media ID was not found on the connected Instagram account."
+                    )
+                _verify_media_record_owner(targeted_item, account, require_explicit_owner=True)
+                matched_item = targeted_item
+        except HTTPException:
+            raise
+        except MetaTokenExpiredError as e:
+            account.is_connected = False
+            db.commit()
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(e))
+        except MetaPermissionError as e:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Connected Instagram account cannot access this media: {str(e)}"
+            )
+        except MetaRateLimitError as e:
+            raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
+        except MetaAPIError as e:
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Meta Graph API error verifying media ownership: {str(e)}")
+
+    if require_video_or_reel:
+        m_type = str(matched_item.get("media_type") or "").upper()
+        p_type = str(matched_item.get("media_product_type") or "").upper()
+        if m_type != "VIDEO" and p_type != "REELS":
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Only VIDEO or REELS media from your connected Instagram account can be analyzed."
+            )
+
+    return matched_item
+
+
 def toggle_sandbox_account(
     db: Session,
     workspace_id: str,
@@ -1024,7 +1329,7 @@ def process_incoming_webhook_event(db: Session, event_data: dict) -> Dict[str, A
         ).first()
 
         if not account:
-            account = db.query(InstagramAccount).filter(InstagramAccount.is_connected == True).first()
+            continue
         
         if not account:
             continue
@@ -1046,7 +1351,7 @@ def process_incoming_webhook_event(db: Session, event_data: dict) -> Dict[str, A
             if not comment_id:
                 continue
 
-            existing_log = db.query(AutomationLog).filter(
+            existing_log = db.query(AutomationLog).join(Automation).filter(Automation.workspace_id == account.workspace_id,
                 AutomationLog.trigger_comment_id == comment_id
             ).first()
             if existing_log:
@@ -1058,6 +1363,7 @@ def process_incoming_webhook_event(db: Session, event_data: dict) -> Dict[str, A
                 continue
 
             automations = db.query(Automation).filter(
+                Automation.workspace_id == account.workspace_id,
                 Automation.ig_account_id == account.id,
                 Automation.is_active == True
             ).all()
@@ -1074,7 +1380,8 @@ def process_incoming_webhook_event(db: Session, event_data: dict) -> Dict[str, A
                     AutomationLog.automation_id == auto.id,
                     (AutomationLog.recipient_username == sender_username) | (AutomationLog.recipient_ig_id == sender_id),
                     AutomationLog.created_at >= cutoff,
-                    AutomationLog.status.in_(["SUCCESS", "SIMULATED"])
+                    AutomationLog.status.in_(["SUCCESS", "SIMULATED"]),
+                    (AutomationLog.trigger_comment_id.is_(None)) | (~AutomationLog.trigger_comment_id.like("sim_%"))
                 ).first()
 
                 if recent_trigger:

@@ -46,6 +46,8 @@ class MetricItem(BaseModel):
     denominator: str
     time_window: str
     source: str
+    category: Optional[str] = "UNAVAILABLE"  # MEASURED, CALCULATED, ESTIMATED, UNAVAILABLE, SIMULATED
+    is_simulated: bool = False
     benchmark: Optional[str] = None
     benchmark_status: Optional[str] = "N/A"  # ABOVE_AVERAGE, AVERAGE, BELOW_AVERAGE, N/A
     limitations: str
@@ -55,17 +57,20 @@ class ScoreComponent(BaseModel):
     name: str
     score: float
     weight: float
-    status: str  # EXCELLENT, GOOD, NEEDS_IMPROVEMENT, POOR
+    status: str  # EXCELLENT, GOOD, NEEDS_IMPROVEMENT, POOR, UNAVAILABLE
     details: str
 
 
 class ScoreDetail(BaseModel):
     score: float
-    rating: str  # EXCEPTIONAL, STRONG, MODERATE, UNDERPERFORMING
+    rating: str  # EXCEPTIONAL, STRONG, MODERATE, UNDERPERFORMING, UNAVAILABLE, INSUFFICIENT_DATA
     confidence: float
     methodology: str
     components: List[ScoreComponent]
     evidence_summary: str
+    score_type: Optional[str] = "AI_ESTIMATE"
+    data_available: Optional[bool] = True
+    limitations: Optional[str] = None
 
 
 class ScoreOverview(BaseModel):
@@ -87,12 +92,15 @@ class TimelineFinding(BaseModel):
     timestamp_end_seconds: float
     time_range_formatted: str
     category: str  # HOOK, PACING, VISUAL_CLARITY, AUDIO_SPEECH, SUBTITLES, STRUCTURE, CTA
-    severity: str  # CRITICAL, WARNING, OPPORTUNITY, STRENGTH
+    severity: str  # CRITICAL, WARNING, OPPORTUNITY, STRENGTH, INFO
     observation: str
     evidence: str
     recommendation: str
     proposed_edit: str
     is_heuristic_risk: bool = True
+    confidence: Optional[float] = None
+    limitations: Optional[str] = None
+    source: Optional[str] = None
 
 
 class ActionPlanItem(BaseModel):
@@ -105,6 +113,8 @@ class ActionPlanItem(BaseModel):
     what_to_change: str
     how_to_implement: str
     follow_up_test_metric: str
+    confidence: Optional[float] = None
+    limitations: Optional[str] = None
 
 
 class CreativeAlternatives(BaseModel):
@@ -145,13 +155,16 @@ class ReelReportSummary(BaseModel):
     analysis_mode: str
     thumbnail_url: Optional[str] = None
     duration_seconds: float
+    duration_measured: bool = True
+    is_simulated: bool = False
+    metric_source: Optional[str] = None
     creative_quality_score: float
     performance_score: float
     growth_conversion_score: float
     viral_potential_estimate: float
-    views_count: Optional[int] = 0
-    likes_count: Optional[int] = 0
-    engagement_rate: Optional[float] = 0.0
+    views_count: Optional[int] = None
+    likes_count: Optional[int] = None
+    engagement_rate: Optional[float] = None
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)

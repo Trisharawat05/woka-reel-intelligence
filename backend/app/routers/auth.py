@@ -1,15 +1,21 @@
 from datetime import datetime, timezone, timedelta
-from fastapi import APIRouter, Depends, HTTPException, status
+from typing import List, Optional
+from fastapi import APIRouter, Depends, Header, HTTPException, status
+from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.models.user import User, RevokedToken
+from app.models.user import User, Workspace, RevokedToken
 from app.schemas.auth import (
-    UserRegister, UserLogin, TokenResponse, UserResponse,
-    WorkspaceResponse, TokenRefreshRequest, TokenRefreshResponse,
+    UserRegister, UserLogin, TokenResponse, OAuth2TokenResponse, UserResponse,
+    WorkspaceResponse, WorkspaceMembershipResponse, WorkspaceSelectRequest,
+    TokenRefreshRequest, TokenRefreshResponse,
     LogoutRequest, MessageResponse
 )
-from app.services.auth_service import register_user, authenticate_user, get_or_create_workspace
+from app.services.auth_service import (
+    register_user, authenticate_user, get_or_create_workspace,
+    list_user_workspace_memberships, resolve_active_workspace
+)
 from app.security import (
     create_access_token, create_refresh_token, decode_token,
     get_current_user, oauth2_scheme
@@ -17,44 +23,101 @@ from app.security import (
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
-@router.post("/register", response_model=TokenResponse, status_code=status.HTTP_201_CREATED)
-def register(payload: UserRegister, db: Session = Depends(get_db)):
-    user, workspace = register_user(db, payload)
-    access_token = create_access_token(data={"sub": user.id, "role": user.role, "workspace_id": workspace.id})
+
+def _create_session_tokens(user: User, workspace: Workspace) -> tuple[str, str]:
+    """Issues workspace-scoped access and refresh JWTs for an authenticated session."""
+    access_token = create_access_token(
+        data={"sub": user.id, "role": user.role, "workspace_id": workspace.id}
+    )
     refresh_token = create_refresh_token(data={"sub": user.id})
-    
+    return access_token, refresh_token
+
+
+def _build_token_response(user: User, workspace: Workspace) -> TokenResponse:
+    """Builds the full JSON auth payload containing session tokens, user, and workspace."""
+    access_token, refresh_token = _create_session_tokens(user, workspace)
     return TokenResponse(
         access_token=access_token,
         refresh_token=refresh_token,
         user=UserResponse.model_validate(user),
-        workspace=WorkspaceResponse.model_validate(workspace)
+        workspace=WorkspaceResponse.model_validate(workspace),
     )
+
+
+@router.post("/register", response_model=TokenResponse, status_code=status.HTTP_201_CREATED)
+def register(payload: UserRegister, db: Session = Depends(get_db)):
+    user, workspace = register_user(db, payload)
+    return _build_token_response(user, workspace)
 
 @router.post("/login", response_model=TokenResponse)
 def login(payload: UserLogin, db: Session = Depends(get_db)):
     user, workspace = authenticate_user(db, payload.email, payload.password)
-    access_token = create_access_token(data={"sub": user.id, "role": user.role, "workspace_id": workspace.id})
-    refresh_token = create_refresh_token(data={"sub": user.id})
+    return _build_token_response(user, workspace)
 
-    return TokenResponse(
+
+@router.post("/token", response_model=OAuth2TokenResponse)
+def login_for_access_token(
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    db: Session = Depends(get_db),
+):
+    """OAuth2 password-flow login for Swagger UI, treating username as the account email."""
+    user, workspace = authenticate_user(db, form_data.username.strip(), form_data.password)
+    access_token, refresh_token = _create_session_tokens(user, workspace)
+    return OAuth2TokenResponse(
         access_token=access_token,
         refresh_token=refresh_token,
-        user=UserResponse.model_validate(user),
-        workspace=WorkspaceResponse.model_validate(workspace)
     )
 
-@router.get("/me", response_model=TokenResponse)
-def get_me(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    workspace = get_or_create_workspace(db, current_user)
-    access_token = create_access_token(data={"sub": current_user.id, "role": current_user.role, "workspace_id": workspace.id})
-    refresh_token = create_refresh_token(data={"sub": current_user.id})
+@router.get("/me", response_model=UserResponse)
+def get_me(current_user: User = Depends(get_current_user)):
+    return UserResponse.model_validate(current_user)
 
-    return TokenResponse(
-        access_token=access_token,
-        refresh_token=refresh_token,
-        user=UserResponse.model_validate(current_user),
-        workspace=WorkspaceResponse.model_validate(workspace)
+
+@router.get("/workspaces", response_model=List[WorkspaceMembershipResponse])
+def list_my_workspaces(
+    current_user: User = Depends(get_current_user),
+    raw_token: str = Depends(oauth2_scheme),
+    x_workspace_id: Optional[str] = Header(default=None, alias="X-Workspace-Id"),
+    db: Session = Depends(get_db),
+):
+    """Lists all workspaces the authenticated user belongs to in deterministic order."""
+    token_data = decode_token(raw_token)
+    active_workspace_id = None
+    if x_workspace_id is not None:
+        ws, _ = resolve_active_workspace(
+            db, current_user, requested_workspace_id=x_workspace_id, token_workspace_id=token_data.get("workspace_id")
+        )
+        active_workspace_id = ws.id
+    elif token_data.get("workspace_id"):
+        active_workspace_id = token_data.get("workspace_id")
+
+    memberships = list_user_workspace_memberships(db, current_user)
+    if active_workspace_id is None and memberships:
+        active_workspace_id = memberships[0][1].id
+
+    return [
+        WorkspaceMembershipResponse(
+            id=ws.id,
+            name=ws.name,
+            owner_id=ws.owner_id,
+            role_in_workspace=member.role_in_workspace,
+            is_active=(ws.id == active_workspace_id),
+        )
+        for member, ws in memberships
+    ]
+
+
+@router.post("/workspaces/select", response_model=TokenResponse)
+def select_active_workspace(
+    payload: WorkspaceSelectRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Validates workspace membership and issues session tokens scoped to the selected workspace."""
+    workspace, _ = resolve_active_workspace(
+        db, current_user, requested_workspace_id=payload.workspace_id
     )
+    return _build_token_response(current_user, workspace)
 
 @router.post("/refresh", response_model=TokenRefreshResponse)
 def refresh_token(payload: TokenRefreshRequest, db: Session = Depends(get_db)):
@@ -89,8 +152,7 @@ def refresh_token(payload: TokenRefreshRequest, db: Session = Depends(get_db)):
         db.add(RevokedToken(jti=jti, token_type="refresh", user_id=user.id, expires_at=expires_at))
 
     workspace = get_or_create_workspace(db, user)
-    new_access_token = create_access_token(data={"sub": user.id, "role": user.role, "workspace_id": workspace.id})
-    new_refresh_token = create_refresh_token(data={"sub": user.id})
+    new_access_token, new_refresh_token = _create_session_tokens(user, workspace)
     db.commit()
 
     return TokenRefreshResponse(

@@ -1,6 +1,8 @@
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from sqlalchemy import inspect, text
 from app.config import settings
 from app.database import Base, engine
 import app.models  # Ensures all models are imported and registered with Base.metadata
@@ -20,8 +22,60 @@ from app.routers import (
     reel_intelligence
 )
 
-# Initialize database tables
-Base.metadata.create_all(bind=engine)
+REQUIRED_SCHEMA_TABLES = {
+    "users",
+    "workspaces",
+    "workspace_members",
+    "instagram_accounts",
+    "instagram_data_deletion_requests",
+    "automations",
+    "reel_analysis_jobs",
+    "reel_reports",
+}
+
+
+def verify_database_schema_ready(db_engine) -> None:
+    """
+    Verifies connectivity and required schema/migration state.
+    In staging, production, or PostgreSQL environments, requires Alembic migration tracking
+    and core tables instead of silently auto-creating un-migrated tables.
+    """
+    env_name = (settings.ENVIRONMENT or "development").lower()
+    strict_migration_check = db_engine.dialect.name != "sqlite" or env_name in ("staging", "production")
+
+    with db_engine.connect() as conn:
+        conn.execute(text("SELECT 1"))
+        if strict_migration_check:
+            inspector = inspect(conn)
+            existing_tables = set(inspector.get_table_names())
+            if "alembic_version" not in existing_tables:
+                raise RuntimeError(
+                    "Database schema is not migrated (missing alembic_version). Run 'alembic upgrade head' before starting."
+                )
+            applied_rev = conn.execute(text("SELECT version_num FROM alembic_version LIMIT 1")).scalar()
+            if not applied_rev:
+                raise RuntimeError(
+                    "Database migration state is empty in alembic_version. Run 'alembic upgrade head' before starting."
+                )
+            missing_tables = sorted(REQUIRED_SCHEMA_TABLES - existing_tables)
+            if missing_tables:
+                raise RuntimeError(
+                    f"Database schema is missing expected migrated tables: {', '.join(missing_tables)}"
+                )
+
+
+# Only auto-create SQLite tables in local dev convenience mode; never mask migrations in staging/production/PostgreSQL
+if (settings.ENVIRONMENT or "development").lower() in ("development", "local") and engine.dialect.name == "sqlite":
+    Base.metadata.create_all(bind=engine)
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    env_name = (settings.ENVIRONMENT or "development").lower()
+    if engine.dialect.name != "sqlite" or env_name in ("staging", "production"):
+        verify_database_schema_ready(engine)
+    yield
+
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
@@ -29,7 +83,8 @@ app = FastAPI(
     description="Woka — Creator Economy SaaS, Instagram Automation & Brand Collaboration API",
     openapi_url=f"{settings.API_V1_STR}/openapi.json",
     docs_url=f"{settings.API_V1_STR}/docs",
-    redoc_url=f"{settings.API_V1_STR}/redoc"
+    redoc_url=f"{settings.API_V1_STR}/redoc",
+    lifespan=lifespan,
 )
 
 # Configure Trusted Hosts Protection
@@ -69,11 +124,9 @@ def liveness_probe():
 
 @app.get("/readyz", tags=["Health"])
 def readiness_probe():
-    """Standard container readiness probe verifying database connectivity."""
+    """Standard container readiness probe verifying database connectivity and migrated schema."""
     try:
-        from sqlalchemy import text
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
+        verify_database_schema_ready(engine)
         return {
             "status": "ready",
             "database": "connected",
@@ -84,7 +137,7 @@ def readiness_probe():
         from fastapi import HTTPException, status
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Database readiness check failed: {str(exc)}"
+            detail=f"Database readiness check failed ({type(exc).__name__}): {str(exc)}"
         )
 
 @app.get("/api/health", tags=["Health"])

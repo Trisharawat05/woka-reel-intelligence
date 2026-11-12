@@ -8,15 +8,7 @@ from app.models.notification import Notification
 from app.models.user import Workspace
 from app.schemas.profile import ProfileUpdate, ProfileResponse, PublicInquiryRequest
 
-def get_profile_by_slug(db: Session, slug: str) -> ProfileResponse:
-    profile = db.query(CreatorProfile).filter(
-        CreatorProfile.slug == slug.lower(),
-        CreatorProfile.is_public == True
-    ).first()
-    
-    if not profile:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Creator media kit not found")
-
+def _build_profile_response(db: Session, profile: CreatorProfile) -> ProfileResponse:
     # Get linked account stats if available
     account = db.query(InstagramAccount).filter(
         InstagramAccount.workspace_id == profile.workspace_id,
@@ -51,6 +43,19 @@ def get_profile_by_slug(db: Session, slug: str) -> ProfileResponse:
         total_reach_30d=reach
     )
 
+
+def get_profile_by_slug(db: Session, slug: str) -> ProfileResponse:
+    profile = db.query(CreatorProfile).filter(
+        CreatorProfile.slug == slug.lower(),
+        CreatorProfile.is_public == True
+    ).first()
+
+    if not profile:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Creator media kit not found")
+
+    return _build_profile_response(db, profile)
+
+
 def get_workspace_profile(db: Session, workspace_id: str) -> ProfileResponse:
     profile = db.query(CreatorProfile).filter(CreatorProfile.workspace_id == workspace_id).first()
     if not profile:
@@ -65,7 +70,8 @@ def get_workspace_profile(db: Session, workspace_id: str) -> ProfileResponse:
         db.commit()
         db.refresh(profile)
 
-    return get_profile_by_slug(db, profile.slug)
+    return _build_profile_response(db, profile)
+
 
 def update_workspace_profile(db: Session, workspace_id: str, payload: ProfileUpdate) -> ProfileResponse:
     profile = db.query(CreatorProfile).filter(CreatorProfile.workspace_id == workspace_id).first()
@@ -93,12 +99,16 @@ def update_workspace_profile(db: Session, workspace_id: str, payload: ProfileUpd
 
     db.commit()
     db.refresh(profile)
-    return get_profile_by_slug(db, profile.slug)
+    return _build_profile_response(db, profile)
+
 
 def submit_public_inquiry(db: Session, slug: str, payload: PublicInquiryRequest) -> dict:
-    profile = db.query(CreatorProfile).filter(CreatorProfile.slug == slug.lower()).first()
+    profile = db.query(CreatorProfile).filter(
+        CreatorProfile.slug == slug.lower(),
+        CreatorProfile.is_public == True
+    ).first()
     if not profile:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Creator not found")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Creator media kit not found")
 
     workspace = db.query(Workspace).filter(Workspace.id == profile.workspace_id).first()
     if workspace:

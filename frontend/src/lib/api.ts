@@ -6,8 +6,15 @@ import {
   Invoice, Subscription, NotificationItem,
   ReelAnalysisJob, ReelReport, ReelReportSummary, ReelComparison
 } from "@/types";
+import { persistWorkspaceSession, type WorkspaceMembershipItem } from "@/lib/auth-session";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api/v1";
+const API_ORIGIN = API_BASE.replace(/\/api\/v1\/?$/, "");
+
+export function resolveMediaUrl(url?: string | null): string | undefined {
+  if (!url) return undefined;
+  return url.startsWith("/api/v1/") ? `${API_ORIGIN}${url}` : url;
+}
 
 class ApiClient {
   private getToken(): string | null {
@@ -67,6 +74,7 @@ class ApiClient {
       body: JSON.stringify(data),
     });
     this.setToken(res.access_token);
+    persistWorkspaceSession(res.workspace);
     return res;
   }
 
@@ -76,11 +84,26 @@ class ApiClient {
       body: JSON.stringify(data),
     });
     this.setToken(res.access_token);
+    persistWorkspaceSession(res.workspace);
     return res;
   }
 
-  async getMe(): Promise<{ access_token: string; user: User; workspace: Workspace }> {
-    return this.request("/auth/me");
+  async getMe(): Promise<User> {
+    return this.request<User>("/auth/me");
+  }
+
+  async listWorkspaces(): Promise<WorkspaceMembershipItem[]> {
+    return this.request<WorkspaceMembershipItem[]>("/auth/workspaces");
+  }
+
+  async selectWorkspace(workspaceId: string): Promise<{ access_token: string; user: User; workspace: Workspace }> {
+    const res = await this.request<{ access_token: string; user: User; workspace: Workspace }>("/auth/workspaces/select", {
+      method: "POST",
+      body: JSON.stringify({ workspace_id: workspaceId }),
+    });
+    this.setToken(res.access_token);
+    persistWorkspaceSession(res.workspace);
+    return res;
   }
 
   // Instagram
@@ -399,9 +422,15 @@ class ApiClient {
       thumbnail_url: string;
       media_url: string;
       views: number;
+      views_available?: boolean;
       likes: number;
+      likes_available?: boolean;
       comments: number;
+      comments_available?: boolean;
       published_at: string;
+      is_simulated?: boolean;
+      data_source?: string;
+      has_synced_insights?: boolean;
     }>;
   }> {
     return this.request("/reel-intelligence/connected-reels");

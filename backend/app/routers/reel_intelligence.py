@@ -1,12 +1,12 @@
 import os
 import json
 from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form, BackgroundTasks
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, status, UploadFile, File, Form, BackgroundTasks
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.models.user import User
+from app.models.user import Workspace
 from app.models.reel_intelligence import ReelAnalysisJob, ReelReport, ReelComparison
 from app.models.instagram import InstagramAccount
 from app.schemas.reel_intelligence import (
@@ -18,20 +18,33 @@ from app.schemas.reel_intelligence import (
     ReelComparisonRequest,
     ReelComparisonResponse
 )
-from app.security import get_current_user, rate_limit
-from app.services.auth_service import get_or_create_workspace
+from app.security import get_active_workspace, rate_limit, create_thumbnail_signature_token, verify_thumbnail_signature_token, resolve_workspace_from_authorization_header
+from app.services.instagram_service import get_sandbox_media_catalog
 from app.services.reel_intelligence_service import (
-    create_url_analysis_job,
+    create_or_get_url_analysis_job,
     create_upload_analysis_job,
-    create_connected_reel_analysis_job,
+    create_or_get_connected_reel_analysis_job,
+    should_schedule_analysis_job,
     execute_reel_analysis,
     get_job_by_id,
     get_report_by_id,
     list_reports,
-    compare_reels
+    compare_reels,
+    resolve_authorized_thumbnail_path
 )
 
 router = APIRouter(prefix="/reel-intelligence", tags=["Woka Reel Intelligence"])
+
+
+def sign_report_thumbnail_url(workspace_id: str, thumbnail_url: Optional[str]) -> Optional[str]:
+    """Attaches a short-lived signed access token to workspace-local thumbnail URLs."""
+    prefix = "/api/v1/reel-intelligence/thumbnails/"
+    if thumbnail_url and thumbnail_url.startswith(prefix):
+        filename = thumbnail_url[len(prefix):].split("?", 1)[0]
+        if filename:
+            token = create_thumbnail_signature_token(workspace_id, filename, expires_seconds=300)
+            return f"{prefix}{filename}?token={token}"
+    return thumbnail_url
 
 
 def format_report_response(report: ReelReport) -> ReelReportResponse:
@@ -51,7 +64,7 @@ def format_report_response(report: ReelReport) -> ReelReportResponse:
         title=report.title,
         caption=report.caption,
         analysis_mode=report.analysis_mode,
-        thumbnail_url=report.thumbnail_url,
+        thumbnail_url=sign_report_thumbnail_url(report.workspace_id, report.thumbnail_url),
         duration_seconds=report.duration_seconds,
         scores=scores_dict,
         calculated_metrics=metrics_dict,
@@ -69,7 +82,7 @@ def format_report_response(report: ReelReport) -> ReelReportResponse:
 def analyze_public_url(
     req: AnalyzePublicUrlRequest,
     background_tasks: BackgroundTasks,
-    current_user: User = Depends(get_current_user),
+    workspace: Workspace = Depends(get_active_workspace),
     db: Session = Depends(get_db),
     _limiter: bool = Depends(rate_limit(max_requests=20, window_seconds=60))
 ):
@@ -77,7 +90,7 @@ def analyze_public_url(
     Submits a public Instagram Reel or video URL for end-to-end AI analysis.
     Executes asynchronously with real-time status polling.
     """
-    workspace = get_or_create_workspace(db, current_user)
+
     declared_dict = {
         "declared_views": req.declared_views,
         "declared_likes": req.declared_likes,
@@ -86,9 +99,10 @@ def analyze_public_url(
         "declared_saves": req.declared_saves
     }
     
-    job = create_url_analysis_job(db, workspace.id, req.url, declared_dict)
-    # Execute immediately in background task for high responsiveness
-    background_tasks.add_task(execute_reel_analysis, db, job.id, declared_dict)
+    job, created = create_or_get_url_analysis_job(db, workspace.id, req.url, declared_dict)
+    # Reuse existing report/execution when an idempotent completed or active job is returned
+    if should_schedule_analysis_job(db, job, created):
+        background_tasks.add_task(execute_reel_analysis, db, job.id, declared_dict, workspace.id)
     return job
 
 
@@ -96,16 +110,16 @@ def analyze_public_url(
 def analyze_video_upload(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
-    current_user: User = Depends(get_current_user),
+    workspace: Workspace = Depends(get_active_workspace),
     db: Session = Depends(get_db),
     _limiter: bool = Depends(rate_limit(max_requests=20, window_seconds=60))
 ):
     """
     Uploads a video file (.mp4, .mov, .webm) and triggers full video intelligence analysis.
     """
-    workspace = get_or_create_workspace(db, current_user)
+
     job = create_upload_analysis_job(db, workspace.id, file)
-    background_tasks.add_task(execute_reel_analysis, db, job.id)
+    background_tasks.add_task(execute_reel_analysis, db, job.id, None, workspace.id)
     return job
 
 
@@ -113,7 +127,7 @@ def analyze_video_upload(
 def analyze_connected_reel(
     req: AnalyzeConnectedReelRequest,
     background_tasks: BackgroundTasks,
-    current_user: User = Depends(get_current_user),
+    workspace: Workspace = Depends(get_active_workspace),
     db: Session = Depends(get_db),
     _limiter: bool = Depends(rate_limit(max_requests=20, window_seconds=60))
 ):
@@ -121,8 +135,8 @@ def analyze_connected_reel(
     Submits a Reel from the creator's connected Instagram professional account.
     Retrieves official Meta Graph API insights (reach, saves, completion ratio).
     """
-    workspace = get_or_create_workspace(db, current_user)
-    job = create_connected_reel_analysis_job(
+
+    job, created = create_or_get_connected_reel_analysis_job(
         db,
         workspace_id=workspace.id,
         media_id=req.media_id,
@@ -131,18 +145,20 @@ def analyze_connected_reel(
         media_url=req.media_url,
         thumbnail_url=req.thumbnail_url
     )
-    background_tasks.add_task(execute_reel_analysis, db, job.id)
+    if should_schedule_analysis_job(db, job, created):
+        cached_media = getattr(job, "_authoritative_media_cache", None)
+        background_tasks.add_task(execute_reel_analysis, db, job.id, None, workspace.id, cached_media)
     return job
 
 
 @router.get("/jobs/{job_id}", response_model=ReelAnalysisJobResponse)
 def get_job_status(
     job_id: str,
-    current_user: User = Depends(get_current_user),
+    workspace: Workspace = Depends(get_active_workspace),
     db: Session = Depends(get_db)
 ):
     """Polls real-time progress and status of an analysis job."""
-    workspace = get_or_create_workspace(db, current_user)
+
     job = get_job_by_id(db, job_id, workspace.id)
     if not job:
         raise HTTPException(
@@ -155,11 +171,11 @@ def get_job_status(
 @router.get("/reports/{report_id}", response_model=ReelReportResponse)
 def get_report(
     report_id: str,
-    current_user: User = Depends(get_current_user),
+    workspace: Workspace = Depends(get_active_workspace),
     db: Session = Depends(get_db)
 ):
     """Retrieves the complete Reel Intelligence report."""
-    workspace = get_or_create_workspace(db, current_user)
+
     report = get_report_by_id(db, report_id, workspace.id)
     if not report:
         raise HTTPException(
@@ -175,28 +191,35 @@ def get_report_history(
     mode: Optional[str] = None,
     limit: int = 50,
     offset: int = 0,
-    current_user: User = Depends(get_current_user),
+    workspace: Workspace = Depends(get_active_workspace),
     db: Session = Depends(get_db)
 ):
     """Lists past Reel reports for the workspace."""
-    workspace = get_or_create_workspace(db, current_user)
+
     reports = list_reports(db, workspace.id, search=search, mode=mode, limit=limit, offset=offset)
     
     summaries = []
     for r in reports:
         metrics = json.loads(r.calculated_metrics_json) if r.calculated_metrics_json else {}
-        views_val = int(metrics.get("views", {}).get("value", 0)) if metrics.get("views", {}).get("value") else 0
-        likes_val = int(metrics.get("likes", {}).get("value", 0)) if metrics.get("likes", {}).get("value") else 0
-        er_val = float(metrics.get("engagement_rate", {}).get("value", 0.0)) if metrics.get("engagement_rate", {}).get("value") else 0.0
-        
+        provenance = json.loads(r.provenance_json) if r.provenance_json else {}
+        views_raw = metrics.get("views", {}).get("value")
+        likes_raw = metrics.get("likes", {}).get("value")
+        er_raw = metrics.get("engagement_rate", {}).get("value")
+        views_val = int(views_raw) if views_raw is not None else None
+        likes_val = int(likes_raw) if likes_raw is not None else None
+        er_val = float(er_raw) if er_raw is not None else None
+
         summaries.append(ReelReportSummary(
             id=r.id,
             workspace_id=r.workspace_id,
             job_id=r.job_id,
             title=r.title,
             analysis_mode=r.analysis_mode,
-            thumbnail_url=r.thumbnail_url,
+            thumbnail_url=sign_report_thumbnail_url(r.workspace_id, r.thumbnail_url),
             duration_seconds=r.duration_seconds,
+            duration_measured=bool(provenance.get("duration_measured", r.duration_seconds > 0)),
+            is_simulated=bool(provenance.get("is_simulated", False)),
+            metric_source=provenance.get("metric_source_mode"),
             creative_quality_score=r.creative_quality_score,
             performance_score=r.performance_score,
             growth_conversion_score=r.growth_conversion_score,
@@ -212,11 +235,11 @@ def get_report_history(
 @router.post("/compare", response_model=ReelComparisonResponse)
 def compare_reports(
     req: ReelComparisonRequest,
-    current_user: User = Depends(get_current_user),
+    workspace: Workspace = Depends(get_active_workspace),
     db: Session = Depends(get_db)
 ):
     """Compares 2 to 5 Reel reports side-by-side."""
-    workspace = get_or_create_workspace(db, current_user)
+
     comp_result = compare_reels(db, workspace.id, req.report_ids)
     
     formatted_reports = [format_report_response(r) for r in comp_result["reports"]]
@@ -253,11 +276,11 @@ def compare_reports(
 def retry_failed_job(
     job_id: str,
     background_tasks: BackgroundTasks,
-    current_user: User = Depends(get_current_user),
+    workspace: Workspace = Depends(get_active_workspace),
     db: Session = Depends(get_db)
 ):
     """Retries an eligible failed analysis job."""
-    workspace = get_or_create_workspace(db, current_user)
+
     job = get_job_by_id(db, job_id, workspace.id)
     if not job:
         raise HTTPException(
@@ -275,21 +298,22 @@ def retry_failed_job(
     job.stage_message = "Retrying analysis"
     job.error_message = None
     db.commit()
+    db.refresh(job)
 
-    background_tasks.add_task(execute_reel_analysis, db, job.id)
+    background_tasks.add_task(execute_reel_analysis, db, job.id, None, workspace.id)
     return job
 
 
 @router.get("/connected-reels")
 def list_connected_account_reels(
-    current_user: User = Depends(get_current_user),
+    workspace: Workspace = Depends(get_active_workspace),
     db: Session = Depends(get_db)
 ):
     """
     Returns candidate Reels from the creator's connected Instagram professional account
     ready for 1-click analysis.
     """
-    workspace = get_or_create_workspace(db, current_user)
+
     account = db.query(InstagramAccount).filter(
         InstagramAccount.workspace_id == workspace.id,
         InstagramAccount.is_connected == True
@@ -333,14 +357,19 @@ def list_connected_account_reels(
                         "media_id": m_id,
                         "title": (item.get("caption") or "Instagram Reel").split("\n")[0][:60],
                         "caption": item.get("caption") or "",
-                        "thumbnail_url": item.get("thumbnail_url") or item.get("media_url") or "",
+                        "thumbnail_url": item.get("thumbnail_url") or "",
                         "media_url": item.get("media_url") or "",
                         "permalink": item.get("permalink") or "",
                         "views": actual_views if actual_views is not None else 0,
-                        "likes": int(item.get("like_count", 0)) if item.get("like_count") is not None else 0,
-                        "comments": int(item.get("comments_count", 0)) if item.get("comments_count") is not None else 0,
+                        "views_available": actual_views is not None,
+                        "likes": int(item["like_count"]) if item.get("like_count") is not None else 0,
+                        "likes_available": item.get("like_count") is not None,
+                        "comments": int(item["comments_count"]) if item.get("comments_count") is not None else 0,
+                        "comments_available": item.get("comments_count") is not None,
                         "published_at": item.get("timestamp") or "",
-                        "has_synced_insights": actual_views is not None
+                        "has_synced_insights": actual_views is not None,
+                        "is_simulated": False,
+                        "data_source": "META_GRAPH_API",
                     })
             return {
                 "has_connected_account": True,
@@ -361,41 +390,25 @@ def list_connected_account_reels(
                 detail=f"Meta Graph API error retrieving reels: {str(e)}"
             )
 
-    # Sample connected account Reels for immediate 1-click analysis (sandbox mode)
+    # Sample connected account Reels for sandbox demo mode (explicitly labeled simulated)
+    sandbox_catalog = get_sandbox_media_catalog(account.ig_user_id)[:3]
     sample_reels = [
         {
-            "media_id": f"ig_reel_{account.ig_user_id}_101",
-            "title": "3 Hook Mistakes That Kill Your Retention",
-            "caption": "Stop starting your Reels with a generic 3-second logo intro. Here's what to do instead. Comment REEL for the checklist! 👇",
-            "thumbnail_url": "https://images.unsplash.com/photo-1574717024653-61fd2cf4d44d?w=600&auto=format&fit=crop&q=80",
-            "media_url": "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4",
-            "views": 48200,
-            "likes": 3120,
-            "comments": 240,
-            "published_at": "2026-10-12T14:30:00Z"
-        },
-        {
-            "media_id": f"ig_reel_{account.ig_user_id}_102",
-            "title": "The 140 WPM Sweet Spot for Spoken Pacing",
-            "caption": "Why rapid-fire delivery without pauses keeps viewers watching until the very end. Save this before recording!",
-            "thumbnail_url": "https://images.unsplash.com/photo-1516321318423-f06f85e504b3?w=600&auto=format&fit=crop&q=80",
-            "media_url": "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerEscapes.mp4",
-            "views": 22100,
-            "likes": 1420,
-            "comments": 88,
-            "published_at": "2026-10-08T09:15:00Z"
-        },
-        {
-            "media_id": f"ig_reel_{account.ig_user_id}_103",
-            "title": "Safe Zones: Don't Let Instagram Hide Your Subtitles",
-            "caption": "If your captions sit in the bottom 20%, half your audience can't read them. Here is the certified safe template.",
-            "thumbnail_url": "https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=600&auto=format&fit=crop&q=80",
-            "media_url": "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerFun.mp4",
-            "views": 16900,
-            "likes": 980,
-            "comments": 64,
-            "published_at": "2026-10-02T18:45:00Z"
+            "media_id": item["id"],
+            "title": item["title"],
+            "caption": item["caption"],
+            "thumbnail_url": item.get("thumbnail_url") or "",
+            "media_url": item.get("media_url") or "",
+            "permalink": item.get("permalink") or "",
+            "views": item.get("views", 0),
+            "likes": item.get("likes", 0),
+            "comments": item.get("comments", 0),
+            "published_at": item.get("timestamp") or "",
+            "is_simulated": True,
+            "data_source": "SANDBOX_SIMULATION",
+            "has_synced_insights": False,
         }
+        for item in sandbox_catalog
     ]
 
     return {
@@ -406,15 +419,45 @@ def list_connected_account_reels(
     }
 
 
-@router.get("/thumbnails/{filename}")
-def serve_thumbnail(filename: str):
-    """Serves locally generated video frame thumbnails securely."""
-    # Prevent directory traversal
-    clean_filename = os.path.basename(filename)
-    # Search across media storage subfolders
-    for root, _, files in os.walk(os.path.join(os.getcwd(), "media_storage")):
-        if clean_filename in files:
-            file_path = os.path.join(root, clean_filename)
-            return FileResponse(file_path, media_type="image/jpeg")
+@router.get("/thumbnails/{filename:path}")
+def serve_thumbnail(
+    filename: str,
+    token: Optional[str] = Query(default=None),
+    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+    x_workspace_id: Optional[str] = Header(default=None, alias="X-Workspace-Id"),
+    db: Session = Depends(get_db),
+):
+    """Serves locally generated video frame thumbnails exclusively to authorized workspace members."""
+    if authorization:
+        workspace = resolve_workspace_from_authorization_header(
+            db=db,
+            authorization=authorization,
+            x_workspace_id=x_workspace_id,
+        )
+        authorized_workspace_id = workspace.id
+    elif token:
+        authorized_workspace_id = verify_thumbnail_signature_token(token, filename)
+        if not authorized_workspace_id:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid or expired thumbnail access token.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required to access workspace thumbnails.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
-    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Thumbnail not found.")
+    file_path = resolve_authorized_thumbnail_path(authorized_workspace_id, filename)
+    return FileResponse(
+        file_path,
+        media_type="image/jpeg",
+        headers={
+            "Cache-Control": "private, no-store, max-age=0",
+            "Pragma": "no-cache",
+            "Referrer-Policy": "no-referrer",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )

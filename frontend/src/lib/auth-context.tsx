@@ -3,6 +3,7 @@
 import React, { createContext, useContext, useEffect, useState } from "react";
 import { User, Workspace } from "@/types";
 import { api } from "@/lib/api";
+import { pickAuthoritativeWorkspace, resolveRestoredWorkspace } from "@/lib/auth-session";
 
 interface AuthContextType {
   user: User | null;
@@ -13,6 +14,7 @@ interface AuthContextType {
   register: (data: any) => Promise<void>;
   logout: () => void;
   refreshUser: () => Promise<void>;
+  switchWorkspace: (workspaceId: string) => Promise<void>;
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
@@ -27,10 +29,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     const savedToken = localStorage.getItem("woka_token");
     if (savedToken) {
       setToken(savedToken);
-      api.getMe()
-        .then((res) => {
-          setUser(res.user);
-          setWorkspace(res.workspace);
+      Promise.all([api.getMe(), api.listWorkspaces().catch(() => null)])
+        .then(([authenticatedUser, memberships]) => {
+          setUser(authenticatedUser);
+          setWorkspace(pickAuthoritativeWorkspace(memberships, authenticatedUser));
         })
         .catch(() => {
           api.clearToken();
@@ -77,16 +79,30 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   const refreshUser = async () => {
     try {
-      const res = await api.getMe();
-      setUser(res.user);
-      setWorkspace(res.workspace);
+      const [authenticatedUser, memberships] = await Promise.all([
+        api.getMe(),
+        api.listWorkspaces().catch(() => null),
+      ]);
+      setUser(authenticatedUser);
+      setWorkspace((prev) =>
+        memberships
+          ? pickAuthoritativeWorkspace(memberships, authenticatedUser)
+          : resolveRestoredWorkspace(authenticatedUser, prev)
+      );
     } catch {
       // Ignored
     }
   };
 
+  const switchWorkspace = async (workspaceId: string) => {
+    const res = await api.selectWorkspace(workspaceId);
+    setUser(res.user);
+    setWorkspace(res.workspace);
+    setToken(res.access_token);
+  };
+
   return (
-    <AuthContext.Provider value={{ user, workspace, token, isLoading, login, register, logout, refreshUser }}>
+    <AuthContext.Provider value={{ user, workspace, token, isLoading, login, register, logout, refreshUser, switchWorkspace }}>
       {children}
     </AuthContext.Provider>
   );

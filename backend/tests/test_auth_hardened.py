@@ -38,7 +38,10 @@ def test_refresh_token_flow_and_rotation(client):
     # Validate that new access token can access /me
     me_res = client.get("/api/v1/auth/me", headers={"Authorization": f"Bearer {new_access}"})
     assert me_res.status_code == 200
-    assert me_res.json()["user"]["email"] == "refresher@woka.io"
+    me_data = me_res.json()
+    assert me_data["email"] == "refresher@woka.io"
+    assert "access_token" not in me_data
+    assert "refresh_token" not in me_data
 
     # Verify old refresh token is revoked and cannot be reused
     reused_res = client.post("/api/v1/auth/refresh", json={"refresh_token": old_refresh})

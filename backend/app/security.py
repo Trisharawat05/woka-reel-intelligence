@@ -3,7 +3,7 @@ import base64
 import hashlib
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Any
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Header, status
 from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
 from passlib.context import CryptContext
@@ -14,7 +14,7 @@ from app.config import settings
 from app.database import get_db
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl=f"{settings.API_V1_STR}/auth/login")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl=f"{settings.API_V1_STR}/auth/token")
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     return pwd_context.verify(plain_password, hashed_password)
@@ -78,7 +78,8 @@ def decrypt_token(encrypted_token: str) -> str:
     except Exception:
         return ""
 
-def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+def authenticate_access_token(db: Session, token: str):
+    """Validates an access JWT, revocation list, and active user status, returning (user, payload)."""
     from app.models.user import User, RevokedToken
     payload = decode_token(token)
     token_type = payload.get("type")
@@ -116,7 +117,37 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Inactive user account"
         )
+    return user, payload
+
+
+def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+    user, _ = authenticate_access_token(db, token)
     return user
+
+
+def resolve_workspace_from_authorization_header(
+    db: Session,
+    authorization: str,
+    x_workspace_id: Optional[str] = None,
+):
+    """Parses Bearer Authorization header, authenticates the user, and resolves active workspace membership."""
+    from app.services.auth_service import resolve_active_workspace
+
+    scheme, _, raw_token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not raw_token.strip():
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    user, payload = authenticate_access_token(db, raw_token.strip())
+    workspace, _ = resolve_active_workspace(
+        db=db,
+        user=user,
+        requested_workspace_id=x_workspace_id,
+        token_workspace_id=payload.get("workspace_id"),
+    )
+    return workspace
 
 def require_roles(allowed_roles: List[str]):
     def role_checker(current_user: Any = Depends(get_current_user)):
@@ -127,6 +158,71 @@ def require_roles(allowed_roles: List[str]):
             )
         return current_user
     return role_checker
+
+
+def require_workspace_membership(allowed_workspace_roles: Optional[List[str]] = None):
+    """
+    Resolves and authorizes the caller's active workspace via X-Workspace-Id header
+    or JWT workspace_id claim, verifying active WorkspaceMember status and role.
+    """
+    def workspace_checker(
+        current_user: Any = Depends(get_current_user),
+        raw_token: str = Depends(oauth2_scheme),
+        x_workspace_id: Optional[str] = Header(default=None, alias="X-Workspace-Id"),
+        db: Session = Depends(get_db),
+    ):
+        from app.services.auth_service import resolve_active_workspace
+
+        token_payload = decode_token(raw_token)
+        token_workspace_id = token_payload.get("workspace_id")
+        workspace, membership = resolve_active_workspace(
+            db=db,
+            user=current_user,
+            requested_workspace_id=x_workspace_id,
+            token_workspace_id=token_workspace_id,
+        )
+        if allowed_workspace_roles is not None and membership.role_in_workspace not in allowed_workspace_roles:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Insufficient workspace permissions for this action",
+            )
+        return workspace
+
+    return workspace_checker
+
+
+get_active_workspace = require_workspace_membership(["OWNER", "ADMIN", "MEMBER"])
+require_workspace_admin = require_workspace_membership(["OWNER", "ADMIN"])
+
+
+def create_thumbnail_signature_token(
+    workspace_id: str,
+    filename: str,
+    expires_seconds: int = 300,
+) -> str:
+    """Creates a short-lived signed token scoped exclusively to one workspace thumbnail file."""
+    expire = datetime.now(timezone.utc) + timedelta(seconds=expires_seconds)
+    payload = {
+        "type": "thumbnail",
+        "workspace_id": workspace_id,
+        "filename": filename,
+        "exp": expire,
+    }
+    return jwt.encode(payload, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
+
+
+def verify_thumbnail_signature_token(token: str, expected_filename: str) -> Optional[str]:
+    """Verifies a thumbnail signature token and returns its authorized workspace_id or None."""
+    try:
+        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+        if payload.get("type") != "thumbnail":
+            return None
+        if payload.get("filename") != expected_filename:
+            return None
+        ws_id = payload.get("workspace_id")
+        return str(ws_id) if ws_id else None
+    except JWTError:
+        return None
 
 
 # ==============================================================================

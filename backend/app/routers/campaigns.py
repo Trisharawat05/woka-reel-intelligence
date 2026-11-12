@@ -4,20 +4,19 @@ from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.models.user import User
+from app.models.user import User, Workspace
 from app.schemas.campaign import (
     CampaignCreate, CampaignResponse,
     ApplicationCreate, ApplicationResponse,
     DeliverableSubmitRequest, DeliverableResponse
 )
-from app.services.auth_service import get_or_create_workspace
 from app.services.campaign_service import (
     create_campaign, list_campaigns, get_campaign,
     apply_to_campaign, list_applications_for_creator,
     list_applications_for_campaign, update_application_status,
     submit_deliverable
 )
-from app.security import get_current_user, require_roles
+from app.security import get_active_workspace, require_roles
 
 router = APIRouter(prefix="/campaigns", tags=["Brand Marketplace & Campaigns"])
 
@@ -51,14 +50,17 @@ def get_campaigns(niche: Optional[str] = Query(None), db: Session = Depends(get_
     return [to_campaign_response(c) for c in campaigns]
 
 @router.post("", response_model=CampaignResponse, status_code=status.HTTP_201_CREATED)
-def post_campaign(payload: CampaignCreate, current_user: User = Depends(require_roles(["BRAND", "AGENCY", "ADMIN"])), db: Session = Depends(get_db)):
-    workspace = get_or_create_workspace(db, current_user)
+def post_campaign(
+    payload: CampaignCreate,
+    _current_user: User = Depends(require_roles(["BRAND", "AGENCY", "ADMIN"])),
+    workspace: Workspace = Depends(get_active_workspace),
+    db: Session = Depends(get_db)
+):
     camp = create_campaign(db, workspace.id, payload)
     return to_campaign_response(camp)
 
 @router.get("/my-applications", response_model=List[ApplicationResponse])
-def get_my_applications(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    workspace = get_or_create_workspace(db, current_user)
+def get_my_applications(workspace: Workspace = Depends(get_active_workspace), db: Session = Depends(get_db)):
     apps = list_applications_for_creator(db, workspace.id)
     return [
         ApplicationResponse(
@@ -80,8 +82,13 @@ def get_one_campaign(campaign_id: str, db: Session = Depends(get_db)):
     return to_campaign_response(camp)
 
 @router.post("/{campaign_id}/apply", response_model=ApplicationResponse, status_code=status.HTTP_201_CREATED)
-def apply_campaign(campaign_id: str, payload: ApplicationCreate, current_user: User = Depends(require_roles(["CREATOR", "AGENCY", "ADMIN"])), db: Session = Depends(get_db)):
-    workspace = get_or_create_workspace(db, current_user)
+def apply_campaign(
+    campaign_id: str,
+    payload: ApplicationCreate,
+    _current_user: User = Depends(require_roles(["CREATOR", "AGENCY", "ADMIN"])),
+    workspace: Workspace = Depends(get_active_workspace),
+    db: Session = Depends(get_db)
+):
     app_record = apply_to_campaign(db, campaign_id, workspace.id, payload)
     return ApplicationResponse(
         id=app_record.id,
@@ -95,8 +102,12 @@ def apply_campaign(campaign_id: str, payload: ApplicationCreate, current_user: U
     )
 
 @router.get("/{campaign_id}/applications", response_model=List[ApplicationResponse])
-def get_campaign_proposals(campaign_id: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    workspace = get_or_create_workspace(db, current_user)
+def get_campaign_proposals(
+    campaign_id: str,
+    _current_user: User = Depends(require_roles(["BRAND", "AGENCY", "ADMIN"])),
+    workspace: Workspace = Depends(get_active_workspace),
+    db: Session = Depends(get_db)
+):
     apps = list_applications_for_campaign(db, campaign_id, workspace.id)
     return [
         ApplicationResponse(
@@ -116,10 +127,10 @@ def get_campaign_proposals(campaign_id: str, current_user: User = Depends(get_cu
 def change_application_status(
     application_id: str,
     new_status: str = Query(..., pattern="^(ACCEPTED|REJECTED|COMPLETED)$"),
-    current_user: User = Depends(get_current_user),
+    _current_user: User = Depends(require_roles(["BRAND", "AGENCY", "ADMIN"])),
+    workspace: Workspace = Depends(get_active_workspace),
     db: Session = Depends(get_db)
 ):
-    workspace = get_or_create_workspace(db, current_user)
     app_record = update_application_status(db, application_id, workspace.id, new_status)
     return ApplicationResponse(
         id=app_record.id,
@@ -135,9 +146,9 @@ def change_application_status(
 def submit_campaign_deliverable(
     application_id: str,
     payload: DeliverableSubmitRequest,
-    current_user: User = Depends(get_current_user),
+    _current_user: User = Depends(require_roles(["CREATOR", "AGENCY", "ADMIN"])),
+    workspace: Workspace = Depends(get_active_workspace),
     db: Session = Depends(get_db)
 ):
-    workspace = get_or_create_workspace(db, current_user)
     deliv = submit_deliverable(db, application_id, workspace.id, payload)
     return DeliverableResponse.model_validate(deliv)

@@ -252,6 +252,8 @@ export interface MetricItem {
   denominator: string;
   time_window: string;
   source: string;
+  category?: "MEASURED" | "CALCULATED" | "ESTIMATED" | "UNAVAILABLE" | "SIMULATED" | string;
+  is_simulated?: boolean;
   benchmark?: string;
   benchmark_status: "ABOVE_AVERAGE" | "AVERAGE" | "BELOW_AVERAGE" | "N/A";
   limitations: string;
@@ -261,17 +263,20 @@ export interface ScoreComponent {
   name: string;
   score: number;
   weight: number;
-  status: "EXCELLENT" | "GOOD" | "NEEDS_IMPROVEMENT" | "POOR";
+  status: "EXCELLENT" | "GOOD" | "NEEDS_IMPROVEMENT" | "POOR" | "UNAVAILABLE";
   details: string;
 }
 
 export interface ScoreDetail {
   score: number;
-  rating: "EXCEPTIONAL" | "STRONG" | "MODERATE" | "UNDERPERFORMING";
+  rating: "EXCEPTIONAL" | "STRONG" | "MODERATE" | "UNDERPERFORMING" | "UNAVAILABLE" | "INSUFFICIENT_DATA";
   confidence: number;
   methodology: string;
   components: ScoreComponent[];
   evidence_summary: string;
+  score_type?: string;
+  data_available?: boolean;
+  limitations?: string;
 }
 
 export interface ScoreOverview {
@@ -293,12 +298,15 @@ export interface TimelineFinding {
   timestamp_end_seconds: number;
   time_range_formatted: string;
   category: "HOOK" | "PACING" | "VISUAL_CLARITY" | "AUDIO_SPEECH" | "SUBTITLES" | "STRUCTURE" | "CTA";
-  severity: "CRITICAL" | "WARNING" | "OPPORTUNITY" | "STRENGTH";
+  severity: "CRITICAL" | "WARNING" | "OPPORTUNITY" | "STRENGTH" | "INFO";
   observation: string;
   evidence: string;
   recommendation: string;
   proposed_edit: string;
   is_heuristic_risk: boolean;
+  confidence?: number;
+  limitations?: string;
+  source?: string;
 }
 
 export interface ActionPlanItem {
@@ -311,6 +319,8 @@ export interface ActionPlanItem {
   what_to_change: string;
   how_to_implement: string;
   follow_up_test_metric: string;
+  confidence?: number;
+  limitations?: string;
 }
 
 export interface CreativeAlternatives {
@@ -359,13 +369,16 @@ export interface ReelReportSummary {
   analysis_mode: "PUBLIC_URL" | "VIDEO_UPLOAD" | "CONNECTED_ACCOUNT";
   thumbnail_url?: string;
   duration_seconds: number;
+  duration_measured?: boolean;
+  is_simulated?: boolean;
+  metric_source?: string | null;
   creative_quality_score: number;
   performance_score: number;
   growth_conversion_score: number;
   viral_potential_estimate: number;
-  views_count: number;
-  likes_count: number;
-  engagement_rate: number;
+  views_count?: number | null;
+  likes_count?: number | null;
+  engagement_rate?: number | null;
   created_at: string;
 }
 

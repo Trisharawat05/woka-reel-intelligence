@@ -31,20 +31,33 @@ class WorkspaceResponse(BaseModel):
 
     model_config = ConfigDict(from_attributes=True)
 
-class TokenResponse(BaseModel):
+class WorkspaceMembershipResponse(BaseModel):
+    id: str
+    name: str
+    owner_id: str
+    role_in_workspace: str
+    is_active: bool = False
+
+class WorkspaceSelectRequest(BaseModel):
+    workspace_id: str = Field(min_length=1)
+
+class OAuth2TokenResponse(BaseModel):
+    """Standard OAuth2 bearer token payload returned by form-based /auth/token login."""
+
     access_token: str
     refresh_token: str
     token_type: str = "bearer"
+
+
+class TokenResponse(OAuth2TokenResponse):
     user: UserResponse
     workspace: WorkspaceResponse
 
 class TokenRefreshRequest(BaseModel):
     refresh_token: str
 
-class TokenRefreshResponse(BaseModel):
-    access_token: str
-    refresh_token: str
-    token_type: str = "bearer"
+class TokenRefreshResponse(OAuth2TokenResponse):
+    """Token pair returned after rotating a refresh token."""
 
 class LogoutRequest(BaseModel):
     refresh_token: Optional[str] = None

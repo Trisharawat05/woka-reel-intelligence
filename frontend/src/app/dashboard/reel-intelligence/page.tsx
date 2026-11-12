@@ -36,7 +36,14 @@ import { Card, CardHeader, CardTitle, CardDescription, CardContent } from "@/com
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
-import { api } from "@/lib/api";
+import { api, resolveMediaUrl } from "@/lib/api";
+import { toFriendlyAnalysisError } from "@/lib/reel-intelligence-errors";
+import {
+  formatReportDurationLabel,
+  getMetricCategoryBadge,
+  getReportSourceBadge,
+  isReportSimulated,
+} from "@/lib/reel-intelligence-truth";
 import { formatNumber, formatPercent } from "@/lib/utils";
 import {
   ReelAnalysisJob,
@@ -64,6 +71,7 @@ export default function ReelIntelligencePage() {
   const [connectedReels, setConnectedReels] = useState<any[]>([]);
   const [hasConnectedAccount, setHasConnectedAccount] = useState<boolean>(true);
   const [connectedUsername, setConnectedUsername] = useState<string>("");
+  const [isSandboxConnected, setIsSandboxConnected] = useState<boolean>(false);
 
   // Job & Report states
   const [activeJob, setActiveJob] = useState<ReelAnalysisJob | null>(null);
@@ -101,6 +109,7 @@ export default function ReelIntelligencePage() {
       if (reelsRes) {
         setHasConnectedAccount(reelsRes.has_connected_account);
         setConnectedReels(reelsRes.reels || []);
+        setIsSandboxConnected(Boolean(reelsRes.is_sandbox));
         if (reelsRes.username) setConnectedUsername(reelsRes.username);
       }
       setReportsList(reportsRes || []);
@@ -123,19 +132,38 @@ export default function ReelIntelligencePage() {
         const job = await api.getReelJob(jobId);
         setActiveJob(job);
 
-        if (job.status === "COMPLETED" && job.report_id) {
+        if (job.status === "COMPLETED") {
           if (pollingRef.current) clearInterval(pollingRef.current);
           setIsLoading(false);
-          await loadReport(job.report_id, true);
+          if (job.report_id) {
+            await loadReport(job.report_id, true);
+          } else {
+            setErrorMsg("Analysis completed, but the report could not be loaded. Please refresh and try again.");
+          }
         } else if (job.status === "FAILED") {
           if (pollingRef.current) clearInterval(pollingRef.current);
           setIsLoading(false);
-          setErrorMsg(job.error_message || "Reel analysis failed during video decoding or metric retrieval.");
+          setErrorMsg(
+            toFriendlyAnalysisError(
+              job.error_message,
+              "Reel analysis failed during video decoding or metric retrieval. Please click Retry Analysis."
+            )
+          );
         }
       } catch (err: any) {
         console.error("Polling error:", err);
       }
     }, 1500);
+  };
+
+  const applyJobSubmissionResult = async (job: ReelAnalysisJob) => {
+    setActiveJob(job);
+    if (job.status === "COMPLETED" && job.report_id) {
+      setIsLoading(false);
+      await loadReport(job.report_id, true);
+      return;
+    }
+    startJobPolling(job.id);
   };
 
   const loadReport = async (reportId: string, switchTab = true) => {
@@ -147,7 +175,7 @@ export default function ReelIntelligencePage() {
         setActiveTab("REPORT");
       }
     } catch (err: any) {
-      setErrorMsg("Failed to load Reel report: " + err.message);
+      setErrorMsg(toFriendlyAnalysisError(err?.message, "Failed to load Reel report. Please try again."));
     } finally {
       setIsLoading(false);
     }
@@ -167,11 +195,10 @@ export default function ReelIntelligencePage() {
         declared_views: declaredViews ? parseInt(declaredViews, 10) : undefined,
         declared_likes: declaredLikes ? parseInt(declaredLikes, 10) : undefined,
       });
-      setActiveJob(job);
-      startJobPolling(job.id);
+      await applyJobSubmissionResult(job);
     } catch (err: any) {
       setIsLoading(false);
-      setErrorMsg(err.message || "Failed to submit Reel URL.");
+      setErrorMsg(toFriendlyAnalysisError(err?.message, "Failed to submit Reel URL."));
     }
   };
 
@@ -191,11 +218,10 @@ export default function ReelIntelligencePage() {
 
     try {
       const job = await api.submitVideoUpload(selectedFile);
-      setActiveJob(job);
-      startJobPolling(job.id);
+      await applyJobSubmissionResult(job);
     } catch (err: any) {
       setIsLoading(false);
-      setErrorMsg(err.message || "Failed to upload video.");
+      setErrorMsg(toFriendlyAnalysisError(err?.message, "Failed to upload video."));
     }
   };
 
@@ -211,11 +237,10 @@ export default function ReelIntelligencePage() {
         media_url: reel.media_url,
         thumbnail_url: reel.thumbnail_url,
       });
-      setActiveJob(job);
-      startJobPolling(job.id);
+      await applyJobSubmissionResult(job);
     } catch (err: any) {
       setIsLoading(false);
-      setErrorMsg(err.message || "Failed to analyze connected Reel.");
+      setErrorMsg(toFriendlyAnalysisError(err?.message, "Failed to analyze connected Reel."));
     }
   };
 
@@ -225,11 +250,10 @@ export default function ReelIntelligencePage() {
     setIsLoading(true);
     try {
       const retried = await api.retryReelJob(activeJob.id);
-      setActiveJob(retried);
-      startJobPolling(retried.id);
+      await applyJobSubmissionResult(retried);
     } catch (err: any) {
       setIsLoading(false);
-      setErrorMsg(err.message || "Retry failed.");
+      setErrorMsg(toFriendlyAnalysisError(err?.message, "Retry failed. Please try again."));
     }
   };
 
@@ -245,7 +269,7 @@ export default function ReelIntelligencePage() {
       setComparisonResult(comp);
       setActiveTab("COMPARE");
     } catch (err: any) {
-      setErrorMsg(err.message || "Comparison failed.");
+      setErrorMsg(toFriendlyAnalysisError(err?.message, "Comparison failed."));
     } finally {
       setIsLoading(false);
     }
@@ -532,9 +556,9 @@ export default function ReelIntelligencePage() {
                     <div className="flex items-center justify-between mb-2">
                       <span className="text-xs font-semibold text-slate-800 flex items-center gap-1.5">
                         <Info className="w-3.5 h-3.5 text-slate-400" />
-                        Optional: Manual Metrics (For Non-Scrapable or Private Profiles)
+                        Optional: Self-Reported Public Metrics
                       </span>
-                      <span className="text-[10px] text-slate-400">Overrides automatic scrape</span>
+                      <span className="text-[10px] text-slate-400">Leave blank to mark metrics Unavailable (never invented)</span>
                     </div>
                     <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
                       <div>
@@ -568,7 +592,7 @@ export default function ReelIntelligencePage() {
                   <div className="flex items-center gap-2 text-[11px] text-slate-500">
                     <ShieldCheck className="w-3.5 h-3.5 text-emerald-600" />
                     <span>
-                      Public Analysis uses compliant public metadata scraping without requiring login credentials.
+                      Public URL submissions evaluate provided URL/text context and self-reported counts. For pixel-level frame, cut, and safe-zone analysis, upload the video in Mode B or use a direct video URL.
                     </span>
                   </div>
                 </form>
@@ -664,19 +688,33 @@ export default function ReelIntelligencePage() {
           {/* MODE C: CONNECTED ACCOUNT REELS */}
           {submissionMode === "CONNECTED_ACCOUNT" && (
             <Card className="border-slate-200 shadow-sm">
-              <CardHeader className="flex flex-row items-center justify-between">
+              <CardHeader className="flex flex-row items-center justify-between gap-2">
                 <div>
                   <CardTitle className="text-base font-bold text-slate-900 flex items-center gap-2">
                     <Instagram className="w-4 h-4 text-emerald-600" />
                     Select a Reel from {connectedUsername ? `@${connectedUsername}` : "Connected Account"}
                   </CardTitle>
                   <CardDescription className="text-xs">
-                    Official Meta Graph API authorized metrics (Reach, Saves, Watch Time Ratio).
+                    {isSandboxConnected
+                      ? "Sandbox Demo Catalog: synthetic Reels and sample engagement figures for UI preview — NOT live Instagram insights."
+                      : "Official Meta Graph API connected Reels. Only metrics returned by Meta Insights are displayed."}
                   </CardDescription>
                 </div>
-                <Badge variant="verified">Meta Graph API Active</Badge>
+                {hasConnectedAccount && (
+                  <Badge variant={isSandboxConnected ? "sandbox" : "verified"}>
+                    {isSandboxConnected ? "Sandbox Demo (Simulated)" : "Meta Graph API Live"}
+                  </Badge>
+                )}
               </CardHeader>
-              <CardContent>
+              <CardContent className="space-y-4">
+                {isSandboxConnected && connectedReels.length > 0 && (
+                  <div className="rounded-xl border border-amber-200 bg-amber-50/80 px-4 py-2.5 text-xs text-amber-900 flex items-center gap-2">
+                    <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+                    <span>
+                      <strong>Sandbox Mode Active:</strong> Metrics shown below are simulated demo data and will be visibly marked simulated in reports.
+                    </span>
+                  </div>
+                )}
                 {connectedReels.length === 0 ? (
                   <div className="p-8 text-center">
                     <AlertTriangle className="w-8 h-8 text-amber-500 mx-auto mb-2" />
@@ -694,25 +732,38 @@ export default function ReelIntelligencePage() {
                         key={reel.media_id}
                         className="group flex flex-col justify-between rounded-xl border border-slate-200 bg-white overflow-hidden hover:border-violet-300 hover:shadow-md transition-all"
                       >
-                        <div className="relative aspect-[9/16] max-h-48 w-full bg-slate-900 overflow-hidden">
-                          <img
-                            src={reel.thumbnail_url}
-                            alt={reel.title}
-                            className="h-full w-full object-cover group-hover:scale-105 transition-transform duration-300"
-                          />
+                        <div className="relative aspect-[9/16] max-h-48 w-full bg-slate-900 overflow-hidden flex items-center justify-center">
+                          {reel.thumbnail_url ? (
+                            <img
+                              src={reel.thumbnail_url}
+                              alt={reel.title}
+                              referrerPolicy="no-referrer"
+                              className="h-full w-full object-cover group-hover:scale-105 transition-transform duration-300"
+                            />
+                          ) : (
+                            <div className="flex flex-col items-center justify-center text-slate-400 text-[11px] gap-1">
+                              <Film className="w-7 h-7 opacity-60" />
+                              <span>No Preview Thumbnail</span>
+                            </div>
+                          )}
+                          {(isSandboxConnected || reel.is_simulated) && (
+                            <span className="absolute top-2 left-2 rounded bg-amber-500/95 px-1.5 py-0.5 text-[9px] font-bold uppercase text-white">
+                              Simulated
+                            </span>
+                          )}
                           <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-transparent" />
                           <div className="absolute bottom-2 left-2 right-2 flex items-center justify-between text-[11px] text-white font-medium">
                             <span className="flex items-center gap-1">
                               <Eye className="w-3 h-3" />
-                              {formatNumber(reel.views)}
+                              {reel.views_available === false ? "N/A" : formatNumber(reel.views)}
                             </span>
                             <span className="flex items-center gap-1">
                               <Heart className="w-3 h-3" />
-                              {formatNumber(reel.likes)}
+                              {reel.likes_available === false ? "N/A" : formatNumber(reel.likes)}
                             </span>
                             <span className="flex items-center gap-1">
                               <MessageCircle className="w-3 h-3" />
-                              {reel.comments}
+                              {reel.comments_available === false ? "N/A" : reel.comments}
                             </span>
                           </div>
                         </div>
@@ -745,44 +796,82 @@ export default function ReelIntelligencePage() {
       {/* ========================================================================= */}
       {/* TAB 2: COMPREHENSIVE REPORT DASHBOARD                                      */}
       {/* ========================================================================= */}
-      {activeTab === "REPORT" && currentReport && (
+      {activeTab === "REPORT" && currentReport && (() => {
+        const reportBadge = getReportSourceBadge(currentReport);
+        const simulated = isReportSimulated(currentReport);
+        const durationLabel = formatReportDurationLabel(currentReport);
+        const aspectRatioLabel = currentReport.video_intelligence?.metadata?.aspect_ratio || "Unavailable";
+        const fpsVal = currentReport.video_intelligence?.metadata?.fps;
+        const resolutionVal = currentReport.video_intelligence?.metadata?.resolution;
+        const retentionMeasured = Boolean(currentReport.provenance?.is_retention_measured);
+        const limitations: string[] = Array.isArray(currentReport.provenance?.limitations)
+          ? currentReport.provenance.limitations
+          : [];
+
+        const scoreCards = [
+          { label: "Creative Quality", detail: currentReport.scores?.creative_quality, bar: "bg-violet-600" },
+          { label: "Hook Strength", detail: currentReport.scores?.hook_strength, bar: "bg-fuchsia-500" },
+          { label: "Editing & Pacing", detail: currentReport.scores?.editing_and_pacing, bar: "bg-cyan-500" },
+          { label: "Content Clarity", detail: currentReport.scores?.content_clarity, bar: "bg-sky-500" },
+          { label: "CTA Effectiveness", detail: currentReport.scores?.cta_effectiveness, bar: "bg-indigo-500" },
+          { label: "Performance Insights", detail: currentReport.scores?.performance ?? currentReport.scores?.performance_insights, bar: "bg-emerald-500" },
+          { label: "Growth & Conversion", detail: currentReport.scores?.growth_conversion ?? currentReport.scores?.growth_and_conversion, bar: "bg-amber-500" },
+          { label: "Viral Potential", detail: currentReport.scores?.viral_potential, bar: "bg-rose-500" },
+        ];
+
+        return (
         <div className="space-y-6">
           {/* Report Top Header Card */}
           <Card className="border-slate-200 shadow-sm overflow-hidden">
             <div className="flex flex-col md:flex-row items-start md:items-center justify-between p-6 gap-4 bg-gradient-to-r from-violet-50/40 via-white to-rose-50/30 border-b border-slate-100">
               <div className="flex items-start gap-4">
-                <div className="relative h-20 w-14 shrink-0 rounded-lg overflow-hidden bg-slate-900 shadow-md border border-slate-200">
-                  <img
-                    src={currentReport.thumbnail_url || "https://images.unsplash.com/photo-1611162617213-7d7a39e9b1d7?w=600&auto=format&fit=crop&q=80"}
-                    alt="Thumbnail"
-                    className="h-full w-full object-cover"
-                  />
+                <div className="relative h-20 w-14 shrink-0 rounded-lg overflow-hidden bg-slate-900 shadow-md border border-slate-200 flex items-center justify-center">
+                  {resolveMediaUrl(currentReport.thumbnail_url) ? (
+                    <img
+                      src={resolveMediaUrl(currentReport.thumbnail_url)}
+                      alt="Reel Thumbnail"
+                      referrerPolicy="no-referrer"
+                      className="h-full w-full object-cover"
+                    />
+                  ) : (
+                    <Film className="w-6 h-6 text-slate-400" />
+                  )}
                   <div className="absolute bottom-1 right-1 rounded bg-black/70 px-1 py-0.5 text-[9px] font-bold text-white">
-                    {Math.round(currentReport.duration_seconds)}s
+                    {durationLabel === "Unavailable" ? "N/A" : durationLabel}
                   </div>
                 </div>
 
                 <div>
-                  <div className="flex items-center gap-2">
+                  <div className="flex flex-wrap items-center gap-2">
                     <h2 className="text-lg font-bold text-slate-900">{currentReport.title}</h2>
-                    <Badge
-                      variant={currentReport.analysis_mode === "CONNECTED_ACCOUNT" ? "verified" : "sandbox"}
-                      className="text-[10px]"
-                    >
-                      {currentReport.analysis_mode === "CONNECTED_ACCOUNT"
-                        ? "Meta Graph API Verified"
-                        : "Public Reel Scrape"}
+                    <Badge variant={reportBadge.variant} className="text-[10px]">
+                      {reportBadge.label}
+                    </Badge>
+                    <Badge variant={retentionMeasured ? "verified" : "secondary"} className="text-[10px]">
+                      {retentionMeasured ? "Retention Measured" : "Retention Not Measured"}
                     </Badge>
                   </div>
-                  <p className="text-xs text-slate-500 mt-1 line-clamp-1 max-w-xl">
+                  <p className="text-xs text-slate-500 mt-1 line-clamp-2 max-w-xl">
                     {currentReport.caption || "No caption text supplied"}
                   </p>
-                  <div className="flex items-center gap-3 text-[11px] text-slate-400 mt-2">
+                  <div className="flex flex-wrap items-center gap-3 text-[11px] text-slate-500 mt-2">
                     <span>Analyzed: {new Date(currentReport.created_at).toLocaleDateString()}</span>
                     <span>•</span>
-                    <span>Duration: {currentReport.duration_seconds.toFixed(1)}s</span>
+                    <span>Duration: {durationLabel}</span>
                     <span>•</span>
-                    <span>Aspect Ratio: {currentReport.video_intelligence?.metadata?.aspect_ratio || "9:16"}</span>
+                    <span>Aspect Ratio: {aspectRatioLabel}</span>
+                    {resolutionVal && (
+                      <>
+                        <span>•</span>
+                        <span>Resolution: {resolutionVal}</span>
+                      </>
+                    )}
+                    {fpsVal && (
+                      <>
+                        <span>•</span>
+                        <span>FPS: {fpsVal}</span>
+                      </>
+                    )}
                   </div>
                 </div>
               </div>
@@ -812,24 +901,37 @@ export default function ReelIntelligencePage() {
               </div>
             </div>
 
-            {/* Public Mode Notice if applicable */}
-            {currentReport.analysis_mode !== "CONNECTED_ACCOUNT" && (
-              <div className="bg-amber-50/80 border-b border-amber-200 px-6 py-2.5 flex items-center justify-between text-xs text-amber-800">
-                <div className="flex items-center gap-2">
-                  <Info className="w-4 h-4 text-amber-600 shrink-0" />
-                  <span>
-                    <strong>Public Mode Limitations:</strong> Private metrics (Unique Reach, Attributed Follows, Completion Ratio) are not accessible via public scraping and are marked accordingly.
-                  </span>
+            {/* Simulated / Provenance & Data Limitations Banner */}
+            {(simulated || limitations.length > 0 || currentReport.analysis_mode !== "CONNECTED_ACCOUNT") && (
+              <div className={`${simulated ? "bg-amber-100/80 border-amber-300 text-amber-950" : "bg-amber-50/80 border-amber-200 text-amber-900"} border-b px-6 py-3 flex flex-col gap-1.5 text-xs`}>
+                <div className="flex items-center justify-between gap-4">
+                  <div className="flex items-center gap-2 font-semibold">
+                    <Info className="w-4 h-4 text-amber-700 shrink-0" />
+                    <span>
+                      {simulated
+                        ? "Simulated Sandbox Data Notice: Metrics and frame samples in this report come from sandbox demo fixtures, NOT live Instagram Insights."
+                        : "Data Source & Analytical Limitations"}
+                    </span>
+                  </div>
+                  {currentReport.analysis_mode !== "CONNECTED_ACCOUNT" && (
+                    <button
+                      onClick={() => {
+                        setSubmissionMode("CONNECTED_ACCOUNT");
+                        setActiveTab("ANALYZE");
+                      }}
+                      className="font-semibold text-amber-900 hover:underline shrink-0"
+                    >
+                      Connect Professional Account →
+                    </button>
+                  )}
                 </div>
-                <button
-                  onClick={() => {
-                    setSubmissionMode("CONNECTED_ACCOUNT");
-                    setActiveTab("ANALYZE");
-                  }}
-                  className="font-semibold text-amber-900 hover:underline shrink-0 ml-4"
-                >
-                  Connect Professional Account →
-                </button>
+                {limitations.length > 0 && (
+                  <ul className="list-disc pl-6 text-[11px] space-y-0.5 text-amber-900/90">
+                    {limitations.map((lim, idx) => (
+                      <li key={idx}>{lim}</li>
+                    ))}
+                  </ul>
+                )}
               </div>
             )}
           </Card>
@@ -842,330 +944,100 @@ export default function ReelIntelligencePage() {
                   8-Dimension Intelligence Score Matrix
                 </h3>
                 <p className="text-[11px] text-slate-400 mt-0.5">
-                  Calibrated multi-dimensional breakdown across creative craft, vocal pacing, and organic distribution
+                  Each card displays whether it is calculated from measured inputs, an AI heuristic estimate, simulated demo data, or unavailable
                 </p>
               </div>
-              <Badge variant="verified" className="text-[10px]">
-                Full Spectrum Diagnosis
+              <Badge variant={simulated ? "sandbox" : "verified"} className="text-[10px]">
+                {simulated ? "Sandbox Simulated" : "Grounded Diagnostics"}
               </Badge>
             </div>
 
-            {/* Row 1: Production & Creative Craft Dimensions */}
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-              {/* 1. Creative Quality Score */}
-              <Card className="border-slate-200 shadow-sm relative overflow-hidden">
-                <div className="absolute top-0 left-0 right-0 h-1 bg-violet-600" />
-                <CardContent className="pt-5">
-                  <div className="flex justify-between items-start">
-                    <div>
-                      <span className="text-[11px] font-bold uppercase tracking-wider text-slate-500">
-                        Creative Quality
-                      </span>
-                      <div className="flex items-baseline gap-1.5 mt-1">
-                        <span className="text-3xl font-extrabold text-slate-900">
-                          {(currentReport.scores?.creative_quality?.score ?? currentReport.creative_quality_score ?? 0).toFixed(0)}
-                        </span>
-                        <span className="text-xs text-slate-400 font-semibold">/100</span>
-                      </div>
-                    </div>
-                    <Badge
-                      variant={(currentReport.scores?.creative_quality?.score ?? currentReport.creative_quality_score ?? 0) >= 75 ? "verified" : "warning"}
-                      className="text-[10px]"
-                    >
-                      {currentReport.scores?.creative_quality?.rating || "STRONG"}
-                    </Badge>
-                  </div>
+              {scoreCards.map(({ label, detail, bar }) => {
+                const available = detail ? detail.data_available !== false && detail.rating !== "UNAVAILABLE" : false;
+                const scoreVal = detail && available ? detail.score.toFixed(0) : "N/A";
+                const ratingLabel = detail?.rating || "UNAVAILABLE";
+                const badgeVariant = !available
+                  ? "secondary"
+                  : detail?.score_type === "SIMULATED"
+                  ? "sandbox"
+                  : (detail?.score ?? 0) >= 75
+                  ? "verified"
+                  : "warning";
 
-                  <div className="mt-4 space-y-1.5 border-t border-slate-100 pt-3">
-                    {currentReport.scores?.creative_quality?.components?.slice(0, 3).map((c, i) => (
-                      <div key={i} className="flex justify-between text-[11px]">
-                        <span className="text-slate-600 truncate max-w-[140px]">{c.name}</span>
-                        <span className="font-semibold text-slate-900">{c.score.toFixed(0)}</span>
+                return (
+                  <Card key={label} className="border-slate-200 shadow-sm relative overflow-hidden">
+                    <div className={`absolute top-0 left-0 right-0 h-1 ${bar}`} />
+                    <CardContent className="pt-5">
+                      <div className="flex justify-between items-start gap-2">
+                        <div>
+                          <span className="text-[11px] font-bold uppercase tracking-wider text-slate-500">
+                            {label}
+                          </span>
+                          <div className="flex items-baseline gap-1.5 mt-1">
+                            <span className="text-3xl font-extrabold text-slate-900">
+                              {scoreVal}
+                            </span>
+                            {available && <span className="text-xs text-slate-400 font-semibold">/100</span>}
+                          </div>
+                        </div>
+                        <Badge variant={badgeVariant} className="text-[10px]">
+                          {ratingLabel}
+                        </Badge>
                       </div>
-                    ))}
-                  </div>
-                </CardContent>
-              </Card>
 
-              {/* 2. Hook Strength */}
-              <Card className="border-slate-200 shadow-sm relative overflow-hidden">
-                <div className="absolute top-0 left-0 right-0 h-1 bg-fuchsia-500" />
-                <CardContent className="pt-5">
-                  <div className="flex justify-between items-start">
-                    <div>
-                      <span className="text-[11px] font-bold uppercase tracking-wider text-slate-500">
-                        Hook Strength
-                      </span>
-                      <div className="flex items-baseline gap-1.5 mt-1">
-                        <span className="text-3xl font-extrabold text-slate-900">
-                          {(currentReport.scores?.hook_strength?.score ?? 84).toFixed(0)}
-                        </span>
-                        <span className="text-xs text-slate-400 font-semibold">/100</span>
+                      <div className="flex items-center justify-between text-[10px] text-slate-500 mt-2">
+                        <span>Type: {detail?.score_type || "UNAVAILABLE"}</span>
+                        <span>Conf: {detail ? `${Math.round((detail.confidence ?? 0) * 100)}%` : "0%"}</span>
                       </div>
-                    </div>
-                    <Badge
-                      variant={(currentReport.scores?.hook_strength?.score ?? 84) >= 75 ? "verified" : "warning"}
-                      className="text-[10px]"
-                    >
-                      {currentReport.scores?.hook_strength?.rating || "STRONG"}
-                    </Badge>
-                  </div>
 
-                  <div className="mt-4 space-y-1.5 border-t border-slate-100 pt-3">
-                    {(currentReport.scores?.hook_strength?.components ?? [
-                      { name: "First 3s Cut & Motion", score: 90 },
-                      { name: "Verbal Curiosity Trigger", score: 85 },
-                      { name: "Opening Frame Text Anchor", score: 88 }
-                    ]).slice(0, 3).map((c, i) => (
-                      <div key={i} className="flex justify-between text-[11px]">
-                        <span className="text-slate-600 truncate max-w-[140px]">{c.name}</span>
-                        <span className="font-semibold text-slate-900">{c.score.toFixed(0)}</span>
+                      <div className="mt-3 space-y-1.5 border-t border-slate-100 pt-2.5">
+                        {(detail?.components || []).slice(0, 3).map((c, i) => (
+                          <div key={i} className="flex justify-between text-[11px] gap-2">
+                            <span className="text-slate-600 truncate max-w-[155px]">{c.name}</span>
+                            <span className="font-semibold text-slate-900 shrink-0">
+                              {c.status === "UNAVAILABLE" ? "N/A" : c.score.toFixed(0)}
+                            </span>
+                          </div>
+                        ))}
                       </div>
-                    ))}
-                  </div>
-                </CardContent>
-              </Card>
 
-              {/* 3. Editing & Pacing */}
-              <Card className="border-slate-200 shadow-sm relative overflow-hidden">
-                <div className="absolute top-0 left-0 right-0 h-1 bg-cyan-500" />
-                <CardContent className="pt-5">
-                  <div className="flex justify-between items-start">
-                    <div>
-                      <span className="text-[11px] font-bold uppercase tracking-wider text-slate-500">
-                        Editing & Pacing
-                      </span>
-                      <div className="flex items-baseline gap-1.5 mt-1">
-                        <span className="text-3xl font-extrabold text-slate-900">
-                          {(currentReport.scores?.editing_and_pacing?.score ?? 88).toFixed(0)}
-                        </span>
-                        <span className="text-xs text-slate-400 font-semibold">/100</span>
-                      </div>
-                    </div>
-                    <Badge
-                      variant={(currentReport.scores?.editing_and_pacing?.score ?? 88) >= 75 ? "verified" : "warning"}
-                      className="text-[10px]"
-                    >
-                      {currentReport.scores?.editing_and_pacing?.rating || "EXCEPTIONAL"}
-                    </Badge>
-                  </div>
-
-                  <div className="mt-4 space-y-1.5 border-t border-slate-100 pt-3">
-                    {(currentReport.scores?.editing_and_pacing?.components ?? [
-                      { name: "Cut Density & Rhythm", score: 88 },
-                      { name: "Stagnation Avoidance", score: 92 },
-                      { name: "Dead Air Trimming", score: 95 }
-                    ]).slice(0, 3).map((c, i) => (
-                      <div key={i} className="flex justify-between text-[11px]">
-                        <span className="text-slate-600 truncate max-w-[140px]">{c.name}</span>
-                        <span className="font-semibold text-slate-900">{c.score.toFixed(0)}</span>
-                      </div>
-                    ))}
-                  </div>
-                </CardContent>
-              </Card>
-
-              {/* 4. Content Clarity */}
-              <Card className="border-slate-200 shadow-sm relative overflow-hidden">
-                <div className="absolute top-0 left-0 right-0 h-1 bg-sky-500" />
-                <CardContent className="pt-5">
-                  <div className="flex justify-between items-start">
-                    <div>
-                      <span className="text-[11px] font-bold uppercase tracking-wider text-slate-500">
-                        Content Clarity
-                      </span>
-                      <div className="flex items-baseline gap-1.5 mt-1">
-                        <span className="text-3xl font-extrabold text-slate-900">
-                          {(currentReport.scores?.content_clarity?.score ?? 82).toFixed(0)}
-                        </span>
-                        <span className="text-xs text-slate-400 font-semibold">/100</span>
-                      </div>
-                    </div>
-                    <Badge
-                      variant={(currentReport.scores?.content_clarity?.score ?? 82) >= 75 ? "verified" : "warning"}
-                      className="text-[10px]"
-                    >
-                      {currentReport.scores?.content_clarity?.rating || "STRONG"}
-                    </Badge>
-                  </div>
-
-                  <div className="mt-4 space-y-1.5 border-t border-slate-100 pt-3">
-                    {(currentReport.scores?.content_clarity?.components ?? [
-                      { name: "Vocal Articulation (WPM)", score: 85 },
-                      { name: "Subtitle Readability", score: 88 },
-                      { name: "Safe-Zone Margin Clearance", score: 80 }
-                    ]).slice(0, 3).map((c, i) => (
-                      <div key={i} className="flex justify-between text-[11px]">
-                        <span className="text-slate-600 truncate max-w-[140px]">{c.name}</span>
-                        <span className="font-semibold text-slate-900">{c.score.toFixed(0)}</span>
-                      </div>
-                    ))}
-                  </div>
-                </CardContent>
-              </Card>
-            </div>
-
-            {/* Row 2: Distribution & Growth Dimensions */}
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-              {/* 5. CTA Effectiveness */}
-              <Card className="border-slate-200 shadow-sm relative overflow-hidden">
-                <div className="absolute top-0 left-0 right-0 h-1 bg-indigo-500" />
-                <CardContent className="pt-5">
-                  <div className="flex justify-between items-start">
-                    <div>
-                      <span className="text-[11px] font-bold uppercase tracking-wider text-slate-500">
-                        CTA Effectiveness
-                      </span>
-                      <div className="flex items-baseline gap-1.5 mt-1">
-                        <span className="text-3xl font-extrabold text-slate-900">
-                          {(currentReport.scores?.cta_effectiveness?.score ?? 76).toFixed(0)}
-                        </span>
-                        <span className="text-xs text-slate-400 font-semibold">/100</span>
-                      </div>
-                    </div>
-                    <Badge
-                      variant={(currentReport.scores?.cta_effectiveness?.score ?? 76) >= 75 ? "verified" : "warning"}
-                      className="text-[10px]"
-                    >
-                      {currentReport.scores?.cta_effectiveness?.rating || "MODERATE"}
-                    </Badge>
-                  </div>
-
-                  <div className="mt-4 space-y-1.5 border-t border-slate-100 pt-3">
-                    {(currentReport.scores?.cta_effectiveness?.components ?? [
-                      { name: "Keyword Specificity", score: 78 },
-                      { name: "Closing Window Timing", score: 90 }
-                    ]).slice(0, 3).map((c, i) => (
-                      <div key={i} className="flex justify-between text-[11px]">
-                        <span className="text-slate-600 truncate max-w-[140px]">{c.name}</span>
-                        <span className="font-semibold text-slate-900">{c.score.toFixed(0)}</span>
-                      </div>
-                    ))}
-                  </div>
-                </CardContent>
-              </Card>
-
-              {/* 6. Performance Insights */}
-              <Card className="border-slate-200 shadow-sm relative overflow-hidden">
-                <div className="absolute top-0 left-0 right-0 h-1 bg-emerald-500" />
-                <CardContent className="pt-5">
-                  <div className="flex justify-between items-start">
-                    <div>
-                      <span className="text-[11px] font-bold uppercase tracking-wider text-slate-500">
-                        Performance Insights
-                      </span>
-                      <div className="flex items-baseline gap-1.5 mt-1">
-                        <span className="text-3xl font-extrabold text-slate-900">
-                          {(currentReport.scores?.performance?.score ?? currentReport.scores?.performance_insights?.score ?? currentReport.performance_score ?? 0).toFixed(0)}
-                        </span>
-                        <span className="text-xs text-slate-400 font-semibold">/100</span>
-                      </div>
-                    </div>
-                    <Badge variant="verified" className="text-[10px]">
-                      {currentReport.scores?.performance?.rating ?? currentReport.scores?.performance_insights?.rating ?? "STRONG"}
-                    </Badge>
-                  </div>
-
-                  <div className="mt-4 space-y-1.5 border-t border-slate-100 pt-3">
-                    {(currentReport.scores?.performance?.components ?? currentReport.scores?.performance_insights?.components ?? []).slice(0, 3).map((c, i) => (
-                      <div key={i} className="flex justify-between text-[11px]">
-                        <span className="text-slate-600 truncate max-w-[140px]">{c.name}</span>
-                        <span className="font-semibold text-slate-900">{c.score.toFixed(0)}</span>
-                      </div>
-                    ))}
-                  </div>
-                </CardContent>
-              </Card>
-
-              {/* 7. Growth & Conversion */}
-              <Card className="border-slate-200 shadow-sm relative overflow-hidden">
-                <div className="absolute top-0 left-0 right-0 h-1 bg-amber-500" />
-                <CardContent className="pt-5">
-                  <div className="flex justify-between items-start">
-                    <div>
-                      <span className="text-[11px] font-bold uppercase tracking-wider text-slate-500">
-                        Growth & Conversion
-                      </span>
-                      <div className="flex items-baseline gap-1.5 mt-1">
-                        <span className="text-3xl font-extrabold text-slate-900">
-                          {(currentReport.scores?.growth_conversion?.score ?? currentReport.scores?.growth_and_conversion?.score ?? currentReport.growth_conversion_score ?? 0).toFixed(0)}
-                        </span>
-                        <span className="text-xs text-slate-400 font-semibold">/100</span>
-                      </div>
-                    </div>
-                    <Badge variant="warning" className="text-[10px]">
-                      {currentReport.scores?.growth_conversion?.rating ?? currentReport.scores?.growth_and_conversion?.rating ?? "MODERATE"}
-                    </Badge>
-                  </div>
-
-                  <div className="mt-4 space-y-1.5 border-t border-slate-100 pt-3">
-                    {(currentReport.scores?.growth_conversion?.components ?? currentReport.scores?.growth_and_conversion?.components ?? []).slice(0, 3).map((c, i) => (
-                      <div key={i} className="flex justify-between text-[11px]">
-                        <span className="text-slate-600 truncate max-w-[140px]">{c.name}</span>
-                        <span className="font-semibold text-slate-900">{c.score.toFixed(0)}</span>
-                      </div>
-                    ))}
-                  </div>
-                </CardContent>
-              </Card>
-
-              {/* 8. Estimated Viral Potential */}
-              <Card className="border-slate-200 shadow-sm relative overflow-hidden">
-                <div className="absolute top-0 left-0 right-0 h-1 bg-rose-500" />
-                <CardContent className="pt-5">
-                  <div className="flex justify-between items-start">
-                    <div>
-                      <span className="text-[11px] font-bold uppercase tracking-wider text-slate-500">
-                        Viral Potential
-                      </span>
-                      <div className="flex items-baseline gap-1.5 mt-1">
-                        <span className="text-3xl font-extrabold text-slate-900">
-                          {(currentReport.scores?.viral_potential?.score ?? currentReport.viral_potential_estimate ?? 0).toFixed(0)}
-                        </span>
-                        <span className="text-xs text-slate-400 font-semibold">/100</span>
-                      </div>
-                    </div>
-                    <Badge variant="warning" className="text-[10px]">
-                      {currentReport.scores?.viral_potential?.rating || "HIGH ESTIMATE"}
-                    </Badge>
-                  </div>
-
-                  <div className="mt-4 space-y-1.5 border-t border-slate-100 pt-3">
-                    {currentReport.scores?.viral_potential?.components?.slice(0, 3).map((c, i) => (
-                      <div key={i} className="flex justify-between text-[11px]">
-                        <span className="text-slate-600 truncate max-w-[140px]">{c.name}</span>
-                        <span className="font-semibold text-slate-900">{c.score.toFixed(0)}</span>
-                      </div>
-                    ))}
-                  </div>
-                </CardContent>
-              </Card>
+                      {detail?.limitations && (
+                        <p className="mt-2 pt-2 border-t border-slate-100 text-[10px] text-slate-400 line-clamp-2">
+                          {detail.limitations}
+                        </p>
+                      )}
+                    </CardContent>
+                  </Card>
+                );
+              })}
             </div>
           </div>
 
           {/* PERFORMANCE METRICS TRANSPARENT GRID */}
           <Card className="border-slate-200 shadow-sm">
             <CardHeader>
-              <CardTitle className="text-sm font-bold text-slate-900 flex items-center justify-between">
-                <span>Calculated Performance Analytics</span>
+              <CardTitle className="text-sm font-bold text-slate-900 flex flex-wrap items-center justify-between gap-2">
+                <span>Performance Analytics & Source Classification</span>
                 <span className="text-xs text-slate-400 font-normal">
-                  Hover cards for transparent Numerator & Denominator breakdown
+                  Measured, Calculated, Simulated, and Unavailable metrics explicitly tagged • Hover for formula & limitations
                 </span>
               </CardTitle>
             </CardHeader>
             <CardContent>
               <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
                 {Object.entries(currentReport.calculated_metrics || {}).map(([key, item]) => {
+                  const catBadge = getMetricCategoryBadge(item);
                   return (
                     <div
                       key={key}
                       className="group relative rounded-xl border border-slate-200 bg-slate-50/50 p-3 hover:border-violet-300 hover:bg-white hover:shadow-sm transition-all"
                     >
-                      <div className="flex items-center justify-between text-[11px] text-slate-500 mb-1">
+                      <div className="flex items-center justify-between gap-1 text-[11px] text-slate-500 mb-1">
                         <span className="font-semibold truncate">{item.name}</span>
                         {item.benchmark_status && item.benchmark_status !== "N/A" && (
                           <span
-                            className={`h-2 w-2 rounded-full ${
+                            className={`h-2 w-2 rounded-full shrink-0 ${
                               item.benchmark_status === "ABOVE_AVERAGE"
                                 ? "bg-emerald-500"
                                 : item.benchmark_status === "AVERAGE"
@@ -1178,13 +1050,19 @@ export default function ReelIntelligencePage() {
                       <div className="text-lg font-extrabold text-slate-900">
                         {item.formatted}
                       </div>
-                      <p className="text-[10px] text-slate-400 mt-0.5 truncate">
-                        {item.benchmark || item.source}
+                      <div className="flex items-center justify-between gap-1 mt-1">
+                        <span className={`text-[9px] font-bold uppercase px-1.5 py-0.5 rounded border ${catBadge.toneClass}`}>
+                          {catBadge.label}
+                        </span>
+                      </div>
+                      <p className="text-[10px] text-slate-400 mt-1 truncate">
+                        {item.source}
                       </p>
 
                       {/* Tooltip Popover on Hover */}
                       <div className="invisible group-hover:visible absolute z-20 left-0 right-0 bottom-full mb-2 p-2.5 rounded-lg bg-slate-900 text-white text-[10px] leading-tight shadow-xl pointer-events-none">
-                        <p className="font-bold text-violet-300">{item.name}</p>
+                        <p className="font-bold text-violet-300">{item.name} ({catBadge.label})</p>
+                        <p className="mt-1"><strong className="text-slate-300">Source:</strong> {item.source}</p>
                         <p className="mt-1"><strong className="text-slate-300">Formula:</strong> {item.numerator} ÷ {item.denominator}</p>
                         <p className="mt-1 text-slate-400"><strong className="text-slate-300">Limitations:</strong> {item.limitations}</p>
                       </div>
@@ -1256,11 +1134,23 @@ export default function ReelIntelligencePage() {
                           </span>
                         </div>
 
-                        {f.is_heuristic_risk && (
-                          <span className="text-[10px] text-slate-400 font-medium">
-                            Creative Heuristic
-                          </span>
-                        )}
+                        <div className="flex items-center gap-2">
+                          {f.source && (
+                            <span className="text-[10px] text-slate-500 bg-slate-100 px-1.5 py-0.5 rounded font-medium">
+                              {f.source}
+                            </span>
+                          )}
+                          {typeof f.confidence === "number" && (
+                            <span className="text-[10px] text-slate-500 font-medium">
+                              Conf {Math.round(f.confidence * 100)}%
+                            </span>
+                          )}
+                          {f.is_heuristic_risk && (
+                            <span className="text-[10px] text-slate-400 font-medium">
+                              Heuristic
+                            </span>
+                          )}
+                        </div>
                       </div>
 
                       <p className="text-xs font-medium text-slate-900">
@@ -1277,6 +1167,11 @@ export default function ReelIntelligencePage() {
                           <span className="text-violet-700 font-medium">{f.proposed_edit}</span>
                         </div>
                       </div>
+                      {f.limitations && (
+                        <p className="text-[10px] text-slate-400">
+                          <strong>Limitation:</strong> {f.limitations}
+                        </p>
+                      )}
                     </div>
                   );
                 })}
@@ -1519,7 +1414,8 @@ export default function ReelIntelligencePage() {
             </CardContent>
           </Card>
         </div>
-      )}
+        );
+      })()}
 
       {/* ========================================================================= */}
       {/* TAB 3: HISTORY & ARCHIVE                                                   */}
@@ -1578,20 +1474,34 @@ export default function ReelIntelligencePage() {
                           onChange={() => toggleCompareSelect(rep.id)}
                           className="h-4 w-4 rounded border-slate-300 text-violet-600 focus:ring-violet-500"
                         />
-                        <div className="relative h-14 w-10 shrink-0 rounded overflow-hidden bg-slate-900 border border-slate-200">
-                          <img
-                            src={rep.thumbnail_url || "https://images.unsplash.com/photo-1611162617213-7d7a39e9b1d7?w=600&auto=format&fit=crop&q=80"}
-                            alt={rep.title}
-                            className="h-full w-full object-cover"
-                          />
+                        <div className="relative h-14 w-10 shrink-0 rounded overflow-hidden bg-slate-900 border border-slate-200 flex items-center justify-center">
+                          {resolveMediaUrl(rep.thumbnail_url) ? (
+                            <img
+                              src={resolveMediaUrl(rep.thumbnail_url)}
+                              alt={rep.title}
+                              referrerPolicy="no-referrer"
+                              className="h-full w-full object-cover"
+                            />
+                          ) : (
+                            <Film className="w-4 h-4 text-slate-400" />
+                          )}
                         </div>
                         <div>
                           <h4 className="text-xs font-bold text-slate-900 line-clamp-1">{rep.title}</h4>
                           <div className="flex items-center gap-2 text-[10px] text-slate-500 mt-0.5">
                             <span>{new Date(rep.created_at).toLocaleDateString()}</span>
                             <span>•</span>
-                            <Badge variant={rep.analysis_mode === "CONNECTED_ACCOUNT" ? "verified" : "sandbox"} className="text-[9px] py-0">
-                              {rep.analysis_mode === "CONNECTED_ACCOUNT" ? "Meta API" : "Public URL"}
+                            <Badge
+                              variant={rep.is_simulated ? "sandbox" : rep.analysis_mode === "CONNECTED_ACCOUNT" ? "verified" : "secondary"}
+                              className="text-[9px] py-0"
+                            >
+                              {rep.is_simulated
+                                ? "Sandbox Simulated"
+                                : rep.analysis_mode === "CONNECTED_ACCOUNT"
+                                ? "Meta API"
+                                : rep.analysis_mode === "VIDEO_UPLOAD"
+                                ? "Upload"
+                                : "Public URL"}
                             </Badge>
                           </div>
                         </div>
@@ -1694,17 +1604,22 @@ export default function ReelIntelligencePage() {
                         )}
 
                         <div className="flex items-center gap-3">
-                          <div className="relative h-14 w-10 shrink-0 rounded overflow-hidden bg-slate-900">
-                            <img
-                              src={rep.thumbnail_url || "https://images.unsplash.com/photo-1611162617213-7d7a39e9b1d7?w=600&auto=format&fit=crop&q=80"}
-                              alt={rep.title}
-                              className="h-full w-full object-cover"
-                            />
+                          <div className="relative h-14 w-10 shrink-0 rounded overflow-hidden bg-slate-900 flex items-center justify-center">
+                            {resolveMediaUrl(rep.thumbnail_url) ? (
+                              <img
+                                src={resolveMediaUrl(rep.thumbnail_url)}
+                                alt={rep.title}
+                                referrerPolicy="no-referrer"
+                                className="h-full w-full object-cover"
+                              />
+                            ) : (
+                              <Film className="w-4 h-4 text-slate-400" />
+                            )}
                           </div>
                           <div>
                             <h4 className="text-xs font-bold text-slate-900 line-clamp-1">{rep.title}</h4>
                             <span className="text-[10px] text-slate-400">
-                              Duration: {rep.duration_seconds.toFixed(0)}s
+                              Duration: {formatReportDurationLabel(rep)} {isReportSimulated(rep) ? "• Simulated" : ""}
                             </span>
                           </div>
                         </div>
@@ -1713,19 +1628,27 @@ export default function ReelIntelligencePage() {
                         <div className="mt-4 pt-3 border-t border-slate-100 space-y-2">
                           <div className="flex justify-between text-xs">
                             <span className="text-slate-500 font-medium">Creative Quality:</span>
-                            <span className="font-extrabold text-slate-900">{(rep.scores?.creative_quality?.score ?? rep.creative_quality_score ?? 0).toFixed(0)}</span>
+                            <span className="font-extrabold text-slate-900">
+                              {rep.scores?.creative_quality?.data_available === false ? "N/A" : (rep.scores?.creative_quality?.score ?? rep.creative_quality_score ?? 0).toFixed(0)}
+                            </span>
                           </div>
                           <div className="flex justify-between text-xs">
                             <span className="text-slate-500 font-medium">Performance Score:</span>
-                            <span className="font-extrabold text-emerald-600">{(rep.scores?.performance?.score ?? rep.performance_score ?? 0).toFixed(0)}</span>
+                            <span className="font-extrabold text-emerald-600">
+                              {rep.scores?.performance?.data_available === false ? "N/A" : (rep.scores?.performance?.score ?? rep.performance_score ?? 0).toFixed(0)}
+                            </span>
                           </div>
                           <div className="flex justify-between text-xs">
                             <span className="text-slate-500 font-medium">Growth Conversion:</span>
-                            <span className="font-extrabold text-amber-600">{(rep.scores?.growth_conversion?.score ?? rep.growth_conversion_score ?? 0).toFixed(0)}</span>
+                            <span className="font-extrabold text-amber-600">
+                              {rep.scores?.growth_conversion?.data_available === false ? "N/A" : (rep.scores?.growth_conversion?.score ?? rep.growth_conversion_score ?? 0).toFixed(0)}
+                            </span>
                           </div>
                           <div className="flex justify-between text-xs">
                             <span className="text-slate-500 font-medium">Viral Potential:</span>
-                            <span className="font-extrabold text-rose-600">{(rep.scores?.viral_potential?.score ?? rep.viral_potential_estimate ?? 0).toFixed(0)}</span>
+                            <span className="font-extrabold text-rose-600">
+                              {rep.scores?.viral_potential?.data_available === false ? "N/A" : (rep.scores?.viral_potential?.score ?? rep.viral_potential_estimate ?? 0).toFixed(0)}
+                            </span>
                           </div>
                         </div>
 

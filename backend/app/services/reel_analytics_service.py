@@ -33,6 +33,7 @@ def _build_unavailable_metric(
     time_window: str,
     benchmark: Optional[str],
     limitations: str,
+    unavailable_reason: str = "Not returned by source",
     is_simulated: bool = False,
 ) -> Dict[str, Any]:
     return {
@@ -42,7 +43,8 @@ def _build_unavailable_metric(
         "numerator": numerator,
         "denominator": denominator,
         "time_window": time_window,
-        "source": "Unavailable (Not Returned / Applicable)",
+        "source": unavailable_reason,
+        "unavailable_reason": unavailable_reason,
         "category": "UNAVAILABLE",
         "is_simulated": is_simulated,
         "benchmark": benchmark,
@@ -77,6 +79,7 @@ def calculate_reel_performance_metrics(
     is_simulated = source_type in ("SANDBOX_SIMULATION", "SANDBOX_SIMULATED")
     is_live_meta = source_type == "META_GRAPH_API"
     is_user_declared = source_type == "USER_DECLARED"
+    is_public_meta = source_type == "PUBLIC_METADATA"
     raw_category = "SIMULATED" if is_simulated else "MEASURED"
     calc_category = "SIMULATED" if is_simulated else "CALCULATED"
 
@@ -87,6 +90,8 @@ def calculate_reel_performance_metrics(
             return f"Meta Graph API ({meta_field})"
         if is_user_declared:
             return "User Self-Reported Input"
+        if is_public_meta:
+            return f"Public Video Metadata ({public_label})"
         return public_label
 
     sim_limitation_suffix = (
@@ -107,7 +112,7 @@ def calculate_reel_performance_metrics(
             "numerator": "Total recorded Reel plays",
             "denominator": "None (absolute integer)",
             "time_window": "Lifetime",
-            "source": _raw_source("views", "Public Reel Input"),
+            "source": _raw_source("views", "Views"),
             "category": raw_category,
             "is_simulated": is_simulated,
             "benchmark": f"{historical_avg_views:,} avg" if historical_avg_views else "N/A",
@@ -118,21 +123,24 @@ def calculate_reel_performance_metrics(
                 else (
                     "Returned by Meta Graph API Insights endpoint."
                     if is_live_meta
-                    else ("Zero plays supplied/recorded." if not is_simulated else sim_limitation_suffix.strip())
+                    else (
+                        "Reported from public video page metadata."
+                        if is_public_meta
+                        else ("Zero plays supplied/recorded." if not is_simulated else sim_limitation_suffix.strip())
+                    )
                 )
             ),
         }
     else:
         metrics["views"] = _build_unavailable_metric(
             name="Total Views / Plays",
-            formatted="N/A (Unavailable)",
+            formatted="N/A",
             numerator="Total recorded Reel plays",
             denominator="None (absolute integer)",
             time_window="Lifetime",
             benchmark=f"{historical_avg_views:,} avg" if historical_avg_views else "N/A",
-            limitations=(
-                "Play count unavailable: no Meta Insights `views` metric or user-declared views supplied."
-            ),
+            limitations="Play count unavailable: views not publicly exposed or returned by source.",
+            unavailable_reason="Not publicly available" if is_public_meta else "Not returned by source",
             is_simulated=is_simulated,
         )
 
@@ -148,7 +156,7 @@ def calculate_reel_performance_metrics(
             "numerator": "Count of unique accounts who viewed the Reel at least once",
             "denominator": "None (unique accounts)",
             "time_window": "Lifetime",
-            "source": _raw_source("reach", "Unavailable"),
+            "source": _raw_source("reach", "Unique Reach"),
             "category": raw_category,
             "is_simulated": is_simulated,
             "benchmark": "70% - 90% of views typical",
@@ -162,12 +170,13 @@ def calculate_reel_performance_metrics(
     else:
         metrics["reach"] = _build_unavailable_metric(
             name="Unique Reach",
-            formatted="N/A (Connected Account Only)",
+            formatted="N/A",
             numerator="Count of unique accounts who viewed the Reel at least once",
             denominator="None (unique accounts)",
             time_window="Lifetime",
             benchmark="70% - 90% of views typical",
             limitations="Unique reach requires an authenticated Meta Graph API connection returning `reach`.",
+            unavailable_reason="Requires connected Instagram account",
             is_simulated=is_simulated,
         )
 
@@ -180,7 +189,7 @@ def calculate_reel_performance_metrics(
             "numerator": "Total like reactions",
             "denominator": "None (absolute integer)",
             "time_window": "Lifetime",
-            "source": _raw_source("like_count", "Public Reel Input"),
+            "source": _raw_source("like_count", "Likes"),
             "category": raw_category,
             "is_simulated": is_simulated,
             "benchmark": "N/A",
@@ -191,19 +200,24 @@ def calculate_reel_performance_metrics(
                 else (
                     "Self-reported like count."
                     if is_user_declared
-                    else "Visible unless creator hides public like counts or Meta omits `like_count`."
+                    else (
+                        "Reported from public video page metadata."
+                        if is_public_meta
+                        else "Visible unless creator hides public like counts or Meta omits `like_count`."
+                    )
                 )
             ),
         }
     else:
         metrics["likes"] = _build_unavailable_metric(
             name="Likes",
-            formatted="N/A (Unavailable)",
+            formatted="N/A",
             numerator="Total like reactions",
             denominator="None (absolute integer)",
             time_window="Lifetime",
             benchmark="N/A",
-            limitations="Like count was not provided or was omitted from the Meta Media response.",
+            limitations="Like count was not provided or was omitted from the platform response.",
+            unavailable_reason="Not returned by source",
             is_simulated=is_simulated,
         )
 
@@ -216,7 +230,7 @@ def calculate_reel_performance_metrics(
             "numerator": "Total top-level comments and replies",
             "denominator": "None (absolute integer)",
             "time_window": "Lifetime",
-            "source": _raw_source("comments_count", "Public Reel Input"),
+            "source": _raw_source("comments_count", "Comments"),
             "category": raw_category,
             "is_simulated": is_simulated,
             "benchmark": "N/A",
@@ -224,18 +238,23 @@ def calculate_reel_performance_metrics(
             "limitations": (
                 sim_limitation_suffix.strip()
                 if is_simulated
-                else "Includes creator replies when present."
+                else (
+                    "Reported from public video page metadata."
+                    if is_public_meta
+                    else "Includes creator replies when present."
+                )
             ),
         }
     else:
         metrics["comments"] = _build_unavailable_metric(
             name="Comments",
-            formatted="N/A (Unavailable)",
+            formatted="N/A",
             numerator="Total top-level comments and replies",
             denominator="None (absolute integer)",
             time_window="Lifetime",
             benchmark="N/A",
-            limitations="Comment count was not provided or was omitted from the Meta Media response.",
+            limitations="Comment count was not provided or was omitted from the platform response.",
+            unavailable_reason="Not returned by source",
             is_simulated=is_simulated,
         )
 
@@ -248,7 +267,7 @@ def calculate_reel_performance_metrics(
             "numerator": "DM shares and external share clicks",
             "denominator": "None (absolute integer)",
             "time_window": "Lifetime",
-            "source": _raw_source("shares", "User Self-Reported Input"),
+            "source": _raw_source("shares", "Shares"),
             "category": raw_category,
             "is_simulated": is_simulated,
             "benchmark": "N/A",
@@ -262,12 +281,13 @@ def calculate_reel_performance_metrics(
     else:
         metrics["shares"] = _build_unavailable_metric(
             name="Shares",
-            formatted="N/A (Requires Connected Insights)",
+            formatted="N/A",
             numerator="DM shares and external share clicks",
             denominator="None (absolute integer)",
             time_window="Lifetime",
             benchmark="N/A",
             limitations="Share counts are private and unavailable without Meta Insights or user input.",
+            unavailable_reason="Requires connected Instagram account",
             is_simulated=is_simulated,
         )
 
@@ -280,7 +300,7 @@ def calculate_reel_performance_metrics(
             "numerator": "Bookmarks saved into user collections",
             "denominator": "None (absolute integer)",
             "time_window": "Lifetime",
-            "source": _raw_source("saved", "User Self-Reported Input"),
+            "source": _raw_source("saved", "Saves"),
             "category": raw_category,
             "is_simulated": is_simulated,
             "benchmark": "N/A",
@@ -294,12 +314,13 @@ def calculate_reel_performance_metrics(
     else:
         metrics["saves"] = _build_unavailable_metric(
             name="Saves / Bookmarks",
-            formatted="N/A (Requires Connected Insights)",
+            formatted="N/A",
             numerator="Bookmarks saved into user collections",
             denominator="None (absolute integer)",
             time_window="Lifetime",
             benchmark="N/A",
-            limitations="Save counts are private and unavailable without Meta Insights or user input.",
+            limitations="Save counts are private to the connected account holder.",
+            unavailable_reason="Requires connected Instagram account",
             is_simulated=is_simulated,
         )
 
@@ -332,6 +353,7 @@ def calculate_reel_performance_metrics(
             time_window="Lifetime",
             benchmark="4.5% - 7.5% typical",
             limitations="Requires both Likes and Views counts.",
+            unavailable_reason="Insufficient data to calculate",
             is_simulated=is_simulated,
         )
 
@@ -356,6 +378,7 @@ def calculate_reel_performance_metrics(
             "limitations": ("Based on sandbox demo counts." if is_simulated else "Calculated against unique accounts reached."),
         }
     else:
+        reach_missing = reach is None
         metrics["like_rate_reach"] = _build_unavailable_metric(
             name="Like Rate (Unique Reach)",
             formatted="N/A",
@@ -364,6 +387,7 @@ def calculate_reel_performance_metrics(
             time_window="Lifetime",
             benchmark="5.5% - 9.0%",
             limitations="Requires both Unique Reach (`reach`) and Likes (`like_count`).",
+            unavailable_reason="Requires connected Instagram account" if reach_missing else "Insufficient data to calculate",
             is_simulated=is_simulated,
         )
 
@@ -392,6 +416,7 @@ def calculate_reel_performance_metrics(
             time_window="Lifetime",
             benchmark="0.3% - 0.8% typical",
             limitations="Requires both Comments and Views counts.",
+            unavailable_reason="Insufficient data to calculate",
             is_simulated=is_simulated,
         )
 
@@ -412,14 +437,16 @@ def calculate_reel_performance_metrics(
             "limitations": ("Based on sandbox demo counts." if is_simulated else "Measures DM/external shares relative to plays."),
         }
     else:
+        shares_missing = shares is None
         metrics["share_rate"] = _build_unavailable_metric(
             name="Share Rate",
-            formatted="N/A (Connected Only)",
+            formatted="N/A",
             numerator="Shares",
             denominator="Total Views",
             time_window="Lifetime",
             benchmark="1.2% - 2.5% typical",
             limitations="Requires both private Shares (`shares`) and Total Views.",
+            unavailable_reason="Requires connected Instagram account" if shares_missing else "Insufficient data to calculate",
             is_simulated=is_simulated,
         )
 
@@ -440,14 +467,16 @@ def calculate_reel_performance_metrics(
             "limitations": ("Based on sandbox demo counts." if is_simulated else "Measures bookmarks relative to plays."),
         }
     else:
+        saves_missing = saves is None
         metrics["save_rate"] = _build_unavailable_metric(
             name="Save Rate",
-            formatted="N/A (Connected Only)",
+            formatted="N/A",
             numerator="Saves",
             denominator="Total Views",
             time_window="Lifetime",
             benchmark="1.5% - 3.5% typical",
             limitations="Requires both private Saves (`saved`) and Total Views.",
+            unavailable_reason="Requires connected Instagram account" if saves_missing else "Insufficient data to calculate",
             is_simulated=is_simulated,
         )
 
@@ -517,12 +546,13 @@ def calculate_reel_performance_metrics(
     else:
         metrics["engagement_rate"] = _build_unavailable_metric(
             name="Engagement Rate",
-            formatted="N/A (Unavailable)",
+            formatted="N/A",
             numerator="Interactions",
             denominator="Unique Reach or Views",
             time_window="Lifetime",
             benchmark="5.0% - 8.5% typical",
             limitations="Insufficient engagement or denominator data (Reach/Views unavailable).",
+            unavailable_reason="Insufficient data to calculate",
             is_simulated=is_simulated,
         )
 
@@ -558,9 +588,10 @@ def calculate_reel_performance_metrics(
             "limitations": watch_limit,
         }
     else:
+        watch_missing = avg_watch_time is None
         metrics["watch_ratio"] = _build_unavailable_metric(
             name="Average Watch Ratio",
-            formatted="N/A (Connected Account Only)",
+            formatted="N/A",
             numerator="Average Watch Time (Unavailable)",
             denominator=f"Video Duration ({dur_str})",
             time_window="Lifetime",
@@ -568,6 +599,7 @@ def calculate_reel_performance_metrics(
             limitations=(
                 "Watch time / retention telemetry is unavailable from Meta Insights or public sources and is not estimated numerically."
             ),
+            unavailable_reason="Requires connected Instagram account" if watch_missing else "Insufficient data to calculate",
             is_simulated=is_simulated,
         )
 
@@ -589,14 +621,16 @@ def calculate_reel_performance_metrics(
             "limitations": "Calculated against stored 30-day workspace account analytics snapshot.",
         }
     else:
+        baseline_missing = historical_avg_views is None
         metrics["benchmark_delta"] = _build_unavailable_metric(
             name="Views vs Account Baseline",
-            formatted="N/A (Requires Historical Baseline)",
+            formatted="N/A",
             numerator="Reel Views",
             denominator="Account Historical Average",
             time_window="30-Day Account Average",
             benchmark="0%",
             limitations="Requires both verified Reel Views and stored 30-day CreatorAnalytics baseline.",
+            unavailable_reason="Requires connected Instagram account" if baseline_missing else "Insufficient data to calculate",
             is_simulated=is_simulated,
         )
 
@@ -630,6 +664,7 @@ def calculate_reel_performance_metrics(
             time_window="Lifetime",
             benchmark="0.2% - 0.5%",
             limitations="Follower attribution per Reel was not returned by Meta Graph API and is unavailable.",
+            unavailable_reason="Requires connected Instagram account",
             is_simulated=is_simulated,
         )
 

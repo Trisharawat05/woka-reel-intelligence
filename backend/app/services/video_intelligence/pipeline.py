@@ -168,6 +168,23 @@ def run_video_intelligence_pipeline(
             "audio_analysis_available": True,
             "audio_source": "AUDIO_PAUSE_TELEMETRY",
         }
+    elif video_metrics.get("audio_extracted"):
+        pauses = video_metrics.get("detected_pauses") or []
+        long_pauses = [p for p in pauses if (p.get("end", 0) - p.get("start", 0)) >= 1.2]
+        audio_metrics = {
+            "word_count": None,
+            "words_per_minute": None,
+            "pacing_rating": "UNAVAILABLE",
+            "pacing_verdict": f"Audio track analyzed via FFmpeg; {len(long_pauses)} pause(s) >= 1.2s detected. Spoken speech transcription was not configured.",
+            "dead_air_count": len(long_pauses),
+            "dead_air_intervals": long_pauses,
+            "has_immediate_verbal_hook": None,
+            "has_curiosity_word_in_hook": None,
+            "audio_clarity_score": 90.0 if len(long_pauses) == 0 else 75.0,
+            "subtitles_synced": None,
+            "audio_analysis_available": True,
+            "audio_source": "FFMPEG_AUDIO_ANALYSIS",
+        }
     else:
         audio_metrics = {
             "word_count": None,
@@ -274,6 +291,8 @@ def run_video_intelligence_pipeline(
             "resolution": resolution_str,
             "resolution_width": width,
             "resolution_height": height,
+            "width": width,
+            "height": height,
             "aspect_ratio": video_metrics.get("aspect_ratio"),
             "fps": video_metrics.get("fps"),
             "fps_measured": bool(video_metrics.get("fps_measured")),
@@ -283,6 +302,15 @@ def run_video_intelligence_pipeline(
             "video_source": video_metrics.get("video_source", "UNAVAILABLE"),
             "sampled_frame_count": video_metrics.get("sampled_frame_count", 0),
             "limitation": video_metrics.get("limitation"),
+        },
+        "video_stream_analyzed": stream_analyzed,
+        "video_source": video_metrics.get("video_source", "UNAVAILABLE"),
+        "limitation_reason": video_metrics.get("limitation"),
+        "visual_metrics": {
+            "scene_cuts_count": video_metrics.get("cuts_detected") or 0,
+            "avg_scene_duration_sec": video_metrics.get("avg_scene_duration_sec"),
+            "data_available": stream_analyzed,
+            "limitation_reason": video_metrics.get("limitation"),
         },
         "frame_telemetry": {
             "frame_observations": video_metrics.get("frame_observations", []),

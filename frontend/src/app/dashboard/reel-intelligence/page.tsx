@@ -42,6 +42,7 @@ import {
   formatReportDurationLabel,
   getMetricCategoryBadge,
   getReportSourceBadge,
+  getVideoExtractionStatus,
   isReportSimulated,
 } from "@/lib/reel-intelligence-truth";
 import { formatNumber, formatPercent } from "@/lib/utils";
@@ -244,17 +245,22 @@ export default function ReelIntelligencePage() {
     }
   };
 
-  const handleRetry = async () => {
-    if (!activeJob) return;
+  const handleRetryReportJob = async (jobId: string) => {
+    if (!jobId) return;
     setErrorMsg(null);
     setIsLoading(true);
     try {
-      const retried = await api.retryReelJob(activeJob.id);
+      const retried = await api.retryReelJob(jobId);
       await applyJobSubmissionResult(retried);
     } catch (err: any) {
       setIsLoading(false);
       setErrorMsg(toFriendlyAnalysisError(err?.message, "Retry failed. Please try again."));
     }
+  };
+
+  const handleRetry = async () => {
+    if (!activeJob) return;
+    await handleRetryReportJob(activeJob.id);
   };
 
   const handleCompareSubmit = async () => {
@@ -387,16 +393,47 @@ export default function ReelIntelligencePage() {
           <CardContent className="pt-6">
             <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
               <div>
-                <div className="flex items-center gap-2">
+                <div className="flex items-center gap-2 flex-wrap">
                   <span className="flex h-2.5 w-2.5 rounded-full bg-violet-600 animate-pulse" />
                   <span className="font-bold text-slate-900 text-sm">
-                    {activeJob.status === "FAILED" ? "Job Failed" : "Analyzing Reel Media..."}
+                    {activeJob.status === "FAILED" ? "Job Failed" : "Analyzing Video Media..."}
                   </span>
-                  <Badge variant="sandbox" className="text-[10px]">
+                  {activeJob.detected_platform && (
+                    <Badge variant="verified" className="text-[10px] capitalize bg-slate-100 text-slate-700 border-slate-300">
+                      Platform: {activeJob.detected_platform.replace("_", " ")}
+                    </Badge>
+                  )}
+                  {activeJob.retrieval_status && (
+                    <Badge variant="sandbox" className="text-[10px]">
+                      {activeJob.retrieval_status}
+                    </Badge>
+                  )}
+                  <Badge variant="secondary" className="text-[10px]">
                     Stage: {activeJob.status}
                   </Badge>
                 </div>
                 <p className="text-xs text-slate-600 mt-1">{activeJob.stage_message}</p>
+                {activeJob.next_action === "CONNECT_INSTAGRAM" && (
+                  <div className="mt-2">
+                    <a
+                      href="/dashboard/instagram"
+                      className="inline-flex items-center gap-1.5 text-xs font-semibold text-violet-700 hover:text-violet-900 underline"
+                    >
+                      Connect Instagram Account (Mode C) &rarr;
+                    </a>
+                  </div>
+                )}
+                {activeJob.next_action === "UPLOAD_MP4" && (
+                  <div className="mt-2">
+                    <button
+                      type="button"
+                      onClick={() => setSubmissionMode("VIDEO_UPLOAD")}
+                      className="inline-flex items-center gap-1.5 text-xs font-semibold text-rose-700 hover:text-rose-900 underline"
+                    >
+                      Upload Video File Directly (Mode B) &rarr;
+                    </button>
+                  </div>
+                )}
               </div>
 
               {activeJob.status === "FAILED" && (
@@ -460,12 +497,12 @@ export default function ReelIntelligencePage() {
                   <LinkIcon className="w-5 h-5" />
                 </div>
                 <div>
-                  <h3 className="text-sm font-bold text-slate-900">Mode A: Public Reel URL</h3>
-                  <p className="text-xs text-slate-500">Analyze any public link</p>
+                  <h3 className="text-sm font-bold text-slate-900">Mode A: Universal Video URL Analysis</h3>
+                  <p className="text-xs text-slate-500">Instagram, YouTube, TikTok, Facebook, Vimeo & Direct Video</p>
                 </div>
               </div>
               <p className="mt-3 text-xs text-slate-600 leading-relaxed">
-                Evaluates video pacing, visual safe zones, speech clarity, and public engagement. Private metrics clearly labeled as estimated.
+                Ingests video URLs from major platforms, direct MP4 streams, or cloud CDN links with automatic platform detection and safe retrieval.
               </p>
             </div>
 
@@ -520,21 +557,21 @@ export default function ReelIntelligencePage() {
               <CardHeader>
                 <CardTitle className="text-base font-bold text-slate-900 flex items-center gap-2">
                   <LinkIcon className="w-4 h-4 text-violet-600" />
-                  Analyze Public Reel URL
+                  Universal Video URL Analysis
                 </CardTitle>
                 <CardDescription className="text-xs">
-                  Enter an Instagram Reel URL (e.g. https://www.instagram.com/reel/C8xyzABC123/) or public video link.
+                  Enter a video URL from Instagram, YouTube, TikTok, Facebook, Vimeo, or a direct MP4/CDN video stream. The universal engine identifies the platform and applies permitted extraction.
                 </CardDescription>
               </CardHeader>
               <CardContent>
                 <form onSubmit={handleSubmitPublicUrl} className="space-y-4">
                   <div>
                     <label className="text-xs font-semibold text-slate-700 block mb-1.5">
-                      Reel URL <span className="text-rose-500">*</span>
+                      Universal Video URL <span className="text-rose-500">*</span>
                     </label>
                     <div className="flex gap-2">
                       <Input
-                        placeholder="https://www.instagram.com/reel/C8xyzABC123/ or direct video link"
+                        placeholder="Paste an Instagram, YouTube, TikTok, Facebook, Vimeo or direct video URL..."
                         value={publicUrl}
                         onChange={(e) => setPublicUrl(e.target.value)}
                         className="flex-1 font-mono text-xs"
@@ -549,6 +586,9 @@ export default function ReelIntelligencePage() {
                         Run Intelligence
                       </Button>
                     </div>
+                    <p className="text-[11px] text-slate-500 mt-1.5">
+                      Accepts video links from Instagram, YouTube, TikTok, Facebook, Vimeo, or direct video streams (<code className="text-[10px] bg-slate-100 px-1 py-0.5 rounded">.mp4</code>, <code className="text-[10px] bg-slate-100 px-1 py-0.5 rounded">.mov</code>, <code className="text-[10px] bg-slate-100 px-1 py-0.5 rounded">.webm</code>). Platforms requiring authentication provide 1-click links to <button type="button" onClick={() => setSubmissionMode("CONNECTED_ACCOUNT")} className="text-violet-600 font-semibold underline">Mode C</button> or direct video upload <button type="button" onClick={() => setSubmissionMode("VIDEO_UPLOAD")} className="text-violet-600 font-semibold underline">Mode B</button>.
+                    </p>
                   </div>
 
                   {/* Optional self-reported metrics for private Reels */}
@@ -592,7 +632,7 @@ export default function ReelIntelligencePage() {
                   <div className="flex items-center gap-2 text-[11px] text-slate-500">
                     <ShieldCheck className="w-3.5 h-3.5 text-emerald-600" />
                     <span>
-                      Public URL submissions evaluate provided URL/text context and self-reported counts. For pixel-level frame, cut, and safe-zone analysis, upload the video in Mode B or use a direct video URL.
+                      Universal Video URL analysis enforces security and platform terms without bypassing access controls. For restricted platforms, connect your account in Mode C or upload the video file directly in Mode B.
                     </span>
                   </div>
                 </form>
@@ -800,6 +840,7 @@ export default function ReelIntelligencePage() {
         const reportBadge = getReportSourceBadge(currentReport);
         const simulated = isReportSimulated(currentReport);
         const durationLabel = formatReportDurationLabel(currentReport);
+        const extractionStatus = getVideoExtractionStatus(currentReport);
         const aspectRatioLabel = currentReport.video_intelligence?.metadata?.aspect_ratio || "Unavailable";
         const fpsVal = currentReport.video_intelligence?.metadata?.fps;
         const resolutionVal = currentReport.video_intelligence?.metadata?.resolution;
@@ -936,6 +977,147 @@ export default function ReelIntelligencePage() {
             )}
           </Card>
 
+          {/* Video Extraction Status Card */}
+          <Card className={`border shadow-sm overflow-hidden ${
+            extractionStatus.status === "DECODED"
+              ? "border-emerald-200 bg-emerald-50/20"
+              : extractionStatus.status === "SIMULATED"
+              ? "border-amber-200 bg-amber-50/20"
+              : "border-amber-300 bg-gradient-to-r from-amber-50/60 via-white to-rose-50/40"
+          }`}>
+            <CardContent className="p-5">
+              <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
+                <div className="flex items-start gap-3">
+                  <div className={`p-2.5 rounded-xl shrink-0 ${
+                    extractionStatus.status === "DECODED"
+                      ? "bg-emerald-100 text-emerald-700"
+                      : extractionStatus.status === "SIMULATED"
+                      ? "bg-amber-100 text-amber-700"
+                      : "bg-amber-100 text-amber-800"
+                  }`}>
+                    {extractionStatus.status === "DECODED" ? (
+                      <CheckCircle2 className="w-5 h-5" />
+                    ) : (
+                      <AlertTriangle className="w-5 h-5" />
+                    )}
+                  </div>
+                  <div className="space-y-1">
+                    <div className="flex items-center gap-2">
+                      <h4 className="text-sm font-bold text-slate-900">
+                        {extractionStatus.status === "DECODED"
+                          ? "Video Stream Decoded & Measured"
+                          : extractionStatus.status === "SIMULATED"
+                          ? "Simulation Sandbox Mode"
+                          : "Video Stream Not Decoded"}
+                      </h4>
+                      <Badge
+                        variant={
+                          extractionStatus.status === "DECODED"
+                            ? "verified"
+                            : extractionStatus.status === "SIMULATED"
+                            ? "sandbox"
+                            : "secondary"
+                        }
+                        className="text-[10px]"
+                      >
+                        {extractionStatus.status === "DECODED"
+                          ? "Measured Video Frames"
+                          : extractionStatus.status === "SIMULATED"
+                          ? "Simulated Demo"
+                          : "Stream Unavailable"}
+                      </Badge>
+                    </div>
+                    <p className="text-xs text-slate-600 max-w-2xl">
+                      {extractionStatus.message}
+                    </p>
+                  </div>
+                </div>
+
+                {/* Actions for Mode B/C when failed */}
+                {extractionStatus.status === "FAILED" && (
+                  <div className="flex flex-wrap items-center gap-2 shrink-0">
+                    <Button
+                      size="sm"
+                      onClick={() => {
+                        setSubmissionMode("VIDEO_UPLOAD");
+                        setActiveTab("ANALYZE");
+                      }}
+                      className="bg-violet-600 hover:bg-violet-700 text-white text-xs h-8"
+                    >
+                      <UploadCloud className="w-3.5 h-3.5 mr-1.5" />
+                      Upload MP4 Video (Mode B)
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => {
+                        setSubmissionMode("CONNECTED_ACCOUNT");
+                        setActiveTab("ANALYZE");
+                      }}
+                      className="text-xs h-8 border-slate-300"
+                    >
+                      <Instagram className="w-3.5 h-3.5 mr-1.5" />
+                      Connect Instagram (Mode C)
+                    </Button>
+                    {extractionStatus.canRetry && currentReport.job_id && (
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => handleRetryReportJob(currentReport.job_id)}
+                        className="text-xs h-8 text-slate-600 hover:text-slate-900"
+                      >
+                        <RotateCcw className="w-3.5 h-3.5 mr-1" />
+                        Retry
+                      </Button>
+                    )}
+                  </div>
+                )}
+              </div>
+
+              {/* Decoded Video Stream Telemetry Grid */}
+              {extractionStatus.status === "DECODED" && currentReport.video_intelligence?.metadata && (
+                <div className="mt-4 pt-3 border-t border-emerald-100 grid grid-cols-2 sm:grid-cols-4 md:grid-cols-6 gap-3 text-xs">
+                  <div className="bg-white/80 p-2 rounded-lg border border-emerald-100">
+                    <span className="text-[10px] text-slate-500 font-semibold block">Resolution</span>
+                    <span className="font-bold text-slate-800">
+                      {(currentReport.video_intelligence.metadata.width ?? currentReport.video_intelligence.metadata.resolution_width) || 0}x{(currentReport.video_intelligence.metadata.height ?? currentReport.video_intelligence.metadata.resolution_height) || 0}
+                    </span>
+                  </div>
+                  <div className="bg-white/80 p-2 rounded-lg border border-emerald-100">
+                    <span className="text-[10px] text-slate-500 font-semibold block">FPS</span>
+                    <span className="font-bold text-slate-800">
+                      {Number(currentReport.video_intelligence.metadata.fps).toFixed(1)}
+                    </span>
+                  </div>
+                  <div className="bg-white/80 p-2 rounded-lg border border-emerald-100">
+                    <span className="text-[10px] text-slate-500 font-semibold block">Duration</span>
+                    <span className="font-bold text-slate-800">
+                      {Number(currentReport.video_intelligence.metadata.duration_seconds).toFixed(1)}s
+                    </span>
+                  </div>
+                  <div className="bg-white/80 p-2 rounded-lg border border-emerald-100">
+                    <span className="text-[10px] text-slate-500 font-semibold block">Aspect Ratio</span>
+                    <span className="font-bold text-slate-800">
+                      {currentReport.video_intelligence.metadata.aspect_ratio || "9:16"}
+                    </span>
+                  </div>
+                  <div className="bg-white/80 p-2 rounded-lg border border-emerald-100">
+                    <span className="text-[10px] text-slate-500 font-semibold block">Scene Cuts</span>
+                    <span className="font-bold text-slate-800">
+                      {currentReport.video_intelligence.visual_metrics?.scene_cuts_count ?? currentReport.video_intelligence.visual_pacing?.cuts_detected ?? 0} cuts
+                    </span>
+                  </div>
+                  <div className="bg-white/80 p-2 rounded-lg border border-emerald-100">
+                    <span className="text-[10px] text-slate-500 font-semibold block">Audio Stream</span>
+                    <span className="font-bold text-slate-800">
+                      {currentReport.video_intelligence.audio_metrics?.data_available ? "Decoded" : "No Audio"}
+                    </span>
+                  </div>
+                </div>
+              )}
+            </CardContent>
+          </Card>
+
           {/* 8-DIMENSION INTELLIGENCE SCORE MATRIX */}
           <div className="space-y-3">
             <div className="flex items-center justify-between">
@@ -1028,40 +1210,69 @@ export default function ReelIntelligencePage() {
               <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
                 {Object.entries(currentReport.calculated_metrics || {}).map(([key, item]) => {
                   const catBadge = getMetricCategoryBadge(item);
+                  const isUnavailable = item.category === "UNAVAILABLE" || item.value === null;
+                  const explanation = item.unavailable_reason || item.source;
+                  const requiresConnected = explanation === "Requires connected Instagram account";
+
                   return (
                     <div
                       key={key}
-                      className="group relative rounded-xl border border-slate-200 bg-slate-50/50 p-3 hover:border-violet-300 hover:bg-white hover:shadow-sm transition-all"
+                      className={`group relative rounded-xl border p-3 transition-all flex flex-col justify-between ${
+                        isUnavailable
+                          ? "border-slate-200 bg-slate-50/70 hover:border-slate-300"
+                          : "border-slate-200 bg-slate-50/50 hover:border-violet-300 hover:bg-white hover:shadow-sm"
+                      }`}
                     >
-                      <div className="flex items-center justify-between gap-1 text-[11px] text-slate-500 mb-1">
-                        <span className="font-semibold truncate">{item.name}</span>
-                        {item.benchmark_status && item.benchmark_status !== "N/A" && (
-                          <span
-                            className={`h-2 w-2 rounded-full shrink-0 ${
-                              item.benchmark_status === "ABOVE_AVERAGE"
-                                ? "bg-emerald-500"
-                                : item.benchmark_status === "AVERAGE"
-                                ? "bg-amber-500"
-                                : "bg-red-500"
+                      <div>
+                        <div className="flex items-center justify-between gap-1 text-[11px] text-slate-500 mb-1">
+                          <span className="font-semibold truncate">{item.name}</span>
+                          {!isUnavailable && item.benchmark_status && item.benchmark_status !== "N/A" && (
+                            <span
+                              className={`h-2 w-2 rounded-full shrink-0 ${
+                                item.benchmark_status === "ABOVE_AVERAGE"
+                                  ? "bg-emerald-500"
+                                  : item.benchmark_status === "AVERAGE"
+                                  ? "bg-amber-500"
+                                  : "bg-red-500"
+                              }`}
+                              title={`Benchmark: ${item.benchmark_status}`}
+                            />
+                          )}
+                        </div>
+                        <div className={`text-lg font-extrabold ${isUnavailable ? "text-slate-400" : "text-slate-900"}`}>
+                          {item.formatted}
+                        </div>
+                      </div>
+
+                      <div className="mt-2 pt-1 border-t border-slate-100">
+                        <div className="flex items-center justify-between gap-1">
+                          <span className={`text-[9px] font-bold uppercase px-1.5 py-0.5 rounded border ${catBadge.toneClass}`}>
+                            {catBadge.label}
+                          </span>
+                        </div>
+                        {isUnavailable ? (
+                          <p
+                            className={`text-[10px] mt-1 leading-snug line-clamp-2 ${
+                              requiresConnected ? "text-amber-700 font-medium" : "text-slate-500"
                             }`}
-                          />
+                            title={explanation}
+                          >
+                            {requiresConnected && <span className="mr-0.5">🔒</span>}
+                            {explanation}
+                          </p>
+                        ) : (
+                          <p className="text-[10px] text-slate-500 mt-1 truncate" title={item.source}>
+                            {item.source}
+                          </p>
                         )}
                       </div>
-                      <div className="text-lg font-extrabold text-slate-900">
-                        {item.formatted}
-                      </div>
-                      <div className="flex items-center justify-between gap-1 mt-1">
-                        <span className={`text-[9px] font-bold uppercase px-1.5 py-0.5 rounded border ${catBadge.toneClass}`}>
-                          {catBadge.label}
-                        </span>
-                      </div>
-                      <p className="text-[10px] text-slate-400 mt-1 truncate">
-                        {item.source}
-                      </p>
 
                       {/* Tooltip Popover on Hover */}
                       <div className="invisible group-hover:visible absolute z-20 left-0 right-0 bottom-full mb-2 p-2.5 rounded-lg bg-slate-900 text-white text-[10px] leading-tight shadow-xl pointer-events-none">
                         <p className="font-bold text-violet-300">{item.name} ({catBadge.label})</p>
+                        {isUnavailable && item.unavailable_reason && (
+                          <p className="mt-1 text-amber-300"><strong className="text-slate-300">Status:</strong> {item.unavailable_reason}</p>
+                        )}
                         <p className="mt-1"><strong className="text-slate-300">Source:</strong> {item.source}</p>
                         <p className="mt-1"><strong className="text-slate-300">Formula:</strong> {item.numerator} ÷ {item.denominator}</p>
                         <p className="mt-1 text-slate-400"><strong className="text-slate-300">Limitations:</strong> {item.limitations}</p>
@@ -1501,7 +1712,7 @@ export default function ReelIntelligencePage() {
                                 ? "Meta API"
                                 : rep.analysis_mode === "VIDEO_UPLOAD"
                                 ? "Upload"
-                                : "Public URL"}
+                                : "Universal Video URL"}
                             </Badge>
                           </div>
                         </div>

@@ -42,6 +42,13 @@ class ReelAnalysisJob(Base):
     error_message = Column(Text, nullable=True)
     source_url = Column(Text, nullable=True)
     source_media_id = Column(String(100), nullable=True)
+
+    # Universal Video Ingestion fields
+    detected_platform = Column(String(50), nullable=True)
+    platform_video_id = Column(String(100), nullable=True)
+    retrieval_status = Column(String(50), nullable=True)
+    next_action = Column(String(50), nullable=True)
+    next_action_url = Column(String(255), nullable=True)
     
     video_asset_id = Column(String(36), ForeignKey("reel_media_assets.id", ondelete="SET NULL"), nullable=True)
     report_id = Column(String(36), ForeignKey("reel_reports.id", ondelete="SET NULL", use_alter=True), nullable=True)

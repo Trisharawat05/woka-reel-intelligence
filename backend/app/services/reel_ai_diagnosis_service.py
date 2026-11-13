@@ -1340,7 +1340,11 @@ def generate_ai_diagnosis_report(
     if is_simulated:
         provenance_limitations.append("SANDBOX SIMULATION: Demo figures shown for testing — NOT live Instagram insights.")
     if not stream_analyzed:
-        provenance_limitations.append("Video frames/pixels were not decoded locally; duration, FPS, resolution, and visual cuts could not be measured.")
+        video_lim = meta.get("limitation")
+        if video_lim:
+            provenance_limitations.append(video_lim)
+        else:
+            provenance_limitations.append("Video frames/pixels were not decoded locally; duration, FPS, resolution, and visual cuts could not be measured.")
     if not audio_available:
         provenance_limitations.append("Spoken audio track was not transcribed; WPM and audio dead-air pauses were not measured.")
     if not timestamped_retention_available:
@@ -1354,6 +1358,7 @@ def generate_ai_diagnosis_report(
         "metric_source_mode": metric_source_mode,
         "video_source": meta.get("video_source", "UNAVAILABLE"),
         "video_stream_analyzed": stream_analyzed,
+        "video_limitation": meta.get("limitation"),
         "duration_measured": duration_measured,
         "fps_measured": bool(meta.get("fps_measured")),
         "video_fps": fps_val,

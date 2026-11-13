@@ -1,7 +1,11 @@
 import os
 import math
 import uuid
+import re
 import tempfile
+import logging
+import subprocess
+import shutil
 import ipaddress
 import socket
 from urllib.parse import urlparse
@@ -9,6 +13,34 @@ from typing import Dict, Any, List, Optional
 import numpy as np
 
 from app.config import settings
+
+logger = logging.getLogger(__name__)
+
+
+def validate_video_file_magic_bytes(header_bytes: bytes) -> bool:
+    """Inspects binary file signature to verify video container and reject executables."""
+    if not header_bytes or len(header_bytes) < 4:
+        return False
+
+    # Reject dangerous executable formats immediately
+    if header_bytes.startswith(b"MZ"):  # Windows PE executable
+        return False
+    if header_bytes.startswith(b"\x7fELF"):  # Linux ELF executable
+        return False
+    if header_bytes.startswith(b"#!/") or header_bytes.startswith(b"<?php"):
+        return False
+    if b"<html" in header_bytes.lower() or b"<!doctype" in header_bytes.lower():
+        return False
+
+    # MP4 / M4V / MOV signature: typically contains 'ftyp' in first 32 bytes or 'moov' / 'mdat' / 'wide'
+    if b"ftyp" in header_bytes[:32] or b"moov" in header_bytes[:32] or b"mdat" in header_bytes[:32] or b"wide" in header_bytes[:32]:
+        return True
+
+    # WebM / MKV starts with \x1a\x45\xdf\xa3
+    if header_bytes.startswith(b"\x1a\x45\xdf\xa3"):
+        return True
+
+    return True  # Fallback for other valid raw video formats
 
 try:
     import cv2
@@ -24,6 +56,42 @@ except ImportError:
 
 
 MAX_REMOTE_VIDEO_BYTES = 25 * 1024 * 1024  # 25 MB bounded stream cap
+
+# Known CDN domains that serve direct video streams
+_CDN_VIDEO_DOMAINS = (
+    ".fbcdn.net",
+    ".cdninstagram.com",
+    ".fbsbx.com",
+    ".fna.fbcdn.net",
+)
+
+_DIRECT_VIDEO_EXTENSIONS = (".mp4", ".mov", ".webm", ".m4v", ".avi", ".mkv")
+
+
+def _is_ip_ssrf_safe(ip_str: str) -> bool:
+    """Returns True if the IP address is publicly routable (not private/loopback/etc)."""
+    try:
+        ip_obj = ipaddress.ip_address(ip_str)
+        return not (ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local
+                    or ip_obj.is_reserved or ip_obj.is_unspecified)
+    except ValueError:
+        return False
+
+
+def _resolve_and_check_ssrf(hostname: str) -> bool:
+    """Resolves hostname and returns True if ALL resolved IPs are publicly routable."""
+    try:
+        ip_obj = ipaddress.ip_address(hostname)
+        return _is_ip_ssrf_safe(hostname)
+    except ValueError:
+        pass
+    try:
+        for _, _, _, _, sockaddr in socket.getaddrinfo(hostname, None):
+            if not _is_ip_ssrf_safe(sockaddr[0]):
+                return False
+    except socket.gaierror:
+        return False
+    return True
 
 
 def _is_public_safe_video_url(media_url: str) -> bool:
@@ -44,60 +112,338 @@ def _is_public_safe_video_url(media_url: str) -> bool:
     if "instagram.com" in hostname and ("/reel/" in parsed.path or "/p/" in parsed.path):
         return False
 
+    return _resolve_and_check_ssrf(hostname)
+
+
+def classify_video_url_type(url: str) -> str:
+    """
+    Classifies a URL for video download purposes.
+
+    Returns:
+        "DIRECT_VIDEO"    — URL ending in .mp4/.mov/.webm or from known CDN domains
+        "INSTAGRAM_PAGE"  — instagram.com/reel/ or /p/ page (HTML, cannot download video)
+        "BLOCKED"         — SSRF-blocked URL (private/loopback IP)
+        "UNKNOWN_HOST"    — Other URLs (attempt download)
+    """
+    if not url or not isinstance(url, str):
+        return "BLOCKED"
+    try:
+        parsed = urlparse(url.strip())
+    except Exception:
+        return "BLOCKED"
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return "BLOCKED"
+
+    hostname = parsed.hostname.lower()
+    path_lower = parsed.path.lower()
+
+    # Check SSRF first
+    if hostname in ("localhost", "127.0.0.1", "0.0.0.0", "::1") or hostname.endswith((".local", ".internal", ".localhost")):
+        return "BLOCKED"
     try:
         ip_obj = ipaddress.ip_address(hostname)
-        if ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local or ip_obj.is_reserved or ip_obj.is_unspecified:
-            return False
+        if not _is_ip_ssrf_safe(hostname):
+            return "BLOCKED"
     except ValueError:
-        try:
-            for _, _, _, _, sockaddr in socket.getaddrinfo(hostname, None):
-                resolved = ipaddress.ip_address(sockaddr[0])
-                if resolved.is_private or resolved.is_loopback or resolved.is_link_local or resolved.is_reserved or resolved.is_unspecified:
-                    return False
-        except socket.gaierror:
-            return False
-    return True
+        pass
+
+    # Instagram page URLs (serve HTML, not video bytes)
+    if "instagram.com" in hostname and ("/reel/" in parsed.path or "/p/" in parsed.path):
+        return "INSTAGRAM_PAGE"
+
+    # Known CDN video domains
+    if any(hostname.endswith(cdn) or re.match(r"scontent[a-z0-9\-]*\.fbcdn\.net", hostname) for cdn in _CDN_VIDEO_DOMAINS):
+        return "DIRECT_VIDEO"
+
+    # Direct video file extensions
+    if any(path_lower.endswith(ext) for ext in _DIRECT_VIDEO_EXTENSIONS):
+        return "DIRECT_VIDEO"
+
+    return "UNKNOWN_HOST"
 
 
-def download_remote_video_to_temp(media_url: str) -> Optional[str]:
+def _sanitize_url_for_log(url: str) -> str:
+    """Extracts only the domain from a URL for safe diagnostic logging. Never logs full URL."""
+    try:
+        parsed = urlparse(url.strip())
+        return parsed.hostname or "<unknown-host>"
+    except Exception:
+        return "<malformed-url>"
+
+
+def download_remote_video_with_diagnostics(media_url: str) -> tuple[Optional[str], str, Optional[str]]:
     """
     Safely downloads a bounded remote video stream to a temporary file for OpenCV inspection.
-    Returns the temp file path on success, or None if unavailable/offline/non-video.
+    Follows redirects (up to 5 hops) and validates the final resolved URL against SSRF.
+
+    Returns:
+        (temp_file_path, video_source, limitation_reason)
     """
-    if (settings.ENVIRONMENT or "").lower() == "test":
-        return None
-    if not HAS_HTTPX or not _is_public_safe_video_url(media_url):
-        return None
+    if not HAS_HTTPX:
+        logger.warning("video_download: httpx not available, skipping remote download")
+        return None, "HTTPX_UNAVAILABLE", "HTTP client is not available in this runtime environment."
+
+    if not media_url or not isinstance(media_url, str):
+        return None, "INVALID_URL", "Media URL is missing or malformed."
+
+    url_type = classify_video_url_type(media_url)
+    domain = _sanitize_url_for_log(media_url)
+
+    if url_type == "BLOCKED":
+        logger.warning("video_download: URL blocked by SSRF check (domain=%s)", domain)
+        return (
+            None,
+            "SSRF_BLOCKED",
+            "URL was blocked because it points to a private, loopback, or restricted network address.",
+        )
+    if url_type == "INSTAGRAM_PAGE":
+        logger.info(
+            "video_download: Instagram page URL detected (domain=%s); "
+            "cannot download video from page URLs without authentication",
+            domain,
+        )
+        return (
+            None,
+            "INSTAGRAM_PAGE_UNSUPPORTED",
+            "Instagram Reel page URLs do not provide direct video stream access without authentication. "
+            "To analyze frame-level visual cuts, pacing, and safe zones, please upload the video file directly (Mode B) "
+            "or connect your Instagram account (Mode C).",
+        )
+
+    logger.info("video_download: attempting download (domain=%s, url_type=%s)", domain, url_type)
 
     tmp_path: Optional[str] = None
     try:
-        with httpx.Client(timeout=httpx.Timeout(connect=3.0, read=6.0, write=3.0, pool=3.0), follow_redirects=False) as client:
+        with httpx.Client(
+            timeout=httpx.Timeout(connect=5.0, read=25.0, write=5.0, pool=5.0),
+            follow_redirects=True,
+            max_redirects=5,
+        ) as client:
             with client.stream("GET", media_url.strip()) as resp:
+                # Validate SSRF on the final resolved URL after redirects
+                final_url = str(resp.url)
+                try:
+                    final_parsed = urlparse(final_url)
+                    final_hostname = (final_parsed.hostname or "").lower()
+                    if final_hostname and not _resolve_and_check_ssrf(final_hostname):
+                        logger.warning(
+                            "video_download: SSRF check failed on resolved URL after redirect (domain=%s)",
+                            final_hostname,
+                        )
+                        return (
+                            None,
+                            "SSRF_REDIRECT_BLOCKED",
+                            "Redirect destination was blocked because it resolves to a private, loopback, or internal network address.",
+                        )
+                except Exception:
+                    logger.warning("video_download: could not parse resolved URL after redirect")
+                    return None, "MALFORMED_REDIRECT_URL", "Could not parse resolved URL after redirect."
+
+                if resp.status_code in (401, 403):
+                    logger.info("video_download: auth required / expired (domain=%s, status=%d)", domain, resp.status_code)
+                    return (
+                        None,
+                        "HTTP_AUTH_REQUIRED",
+                        f"Remote server returned HTTP {resp.status_code} (access denied). The media URL requires authentication or the signed URL has expired.",
+                    )
+                if resp.status_code == 404:
+                    logger.info("video_download: not found (domain=%s, status=404)", domain)
+                    return None, "HTTP_NOT_FOUND", "Remote server returned HTTP 404 (media not found)."
                 if resp.status_code != 200:
-                    return None
+                    logger.info("video_download: non-200 status (domain=%s, status=%d)", domain, resp.status_code)
+                    return None, "HTTP_ERROR", f"Remote server returned HTTP {resp.status_code}."
+
                 ctype = (resp.headers.get("content-type") or "").lower()
+                logger.info("video_download: response received (domain=%s, status=%d, content_type=%s)", domain, resp.status_code, ctype)
+
                 if ctype and not (ctype.startswith("video/") or ctype == "application/octet-stream"):
-                    return None
+                    if "text/html" in ctype or "text/plain" in ctype:
+                        logger.info("video_download: rejected — response is HTML/text, not video (domain=%s)", domain)
+                        return (
+                            None,
+                            "HTML_RESPONSE_NOT_VIDEO",
+                            "The URL returned an HTML webpage instead of a raw video stream. Instagram and social media page URLs require authentication and do not expose raw video bytes publicly. Please use Connected Instagram (Mode C) or upload the video file directly (Mode B).",
+                        )
+                    logger.info("video_download: rejected — unsupported content-type (domain=%s, type=%s)", domain, ctype)
+                    return None, "UNSUPPORTED_CONTENT_TYPE", f"Remote server returned unsupported Content-Type: '{ctype}'. Expected video stream."
 
                 fd, tmp_path = tempfile.mkstemp(prefix="woka_stream_", suffix=".mp4")
                 os.close(fd)
                 written = 0
                 with open(tmp_path, "wb") as f:
                     for chunk in resp.iter_bytes(chunk_size=262144):
+                        if written == 0 and chunk:
+                            first_bytes = chunk[:256].lower()
+                            if b"<html" in first_bytes or b"<!doctype" in first_bytes:
+                                logger.info("video_download: rejected — HTML page received instead of video (domain=%s)", domain)
+                                return (
+                                    None,
+                                    "HTML_RESPONSE_NOT_VIDEO",
+                                    "The URL returned an HTML webpage instead of a raw video stream. Instagram and social media page URLs require authentication and do not expose raw video bytes publicly. Please use Connected Instagram (Mode C) or upload the video file directly (Mode B).",
+                                )
                         written += len(chunk)
                         if written > MAX_REMOTE_VIDEO_BYTES:
-                            raise ValueError("Remote video stream exceeds analysis size cap.")
+                            return (
+                                None,
+                                "FILE_TOO_LARGE",
+                                f"Remote video stream exceeds maximum download size cap ({MAX_REMOTE_VIDEO_BYTES // (1024*1024)} MB).",
+                            )
                         f.write(chunk)
                 if written < 128:
-                    raise ValueError("Remote response too small to be a valid video stream.")
-                return tmp_path
-    except Exception:
+                    return None, "RESPONSE_TOO_SMALL", "Remote response too small to be a valid video stream."
+
+                with open(tmp_path, "rb") as f:
+                    header = f.read(64)
+                if not validate_video_file_magic_bytes(header):
+                    logger.info("video_download: rejected — file signature validation failed (domain=%s, size=%d)", domain, written)
+                    return None, "INVALID_MAGIC_BYTES", "Downloaded file signature does not match any supported video container (MP4, MOV, WebM)."
+
+                logger.info("video_download: file signature validated (domain=%s, size=%d bytes)", domain, written)
+                return tmp_path, "OPENCV_REMOTE_STREAM", None
+    except Exception as exc:
         if tmp_path and os.path.exists(tmp_path):
             try:
                 os.remove(tmp_path)
             except OSError:
                 pass
+        if not isinstance(exc, ValueError):
+            logger.warning("video_download: download failed (domain=%s, error=%s)", domain, type(exc).__name__)
+        return None, "DOWNLOAD_FAILED", f"Remote video stream download failed: {type(exc).__name__}."
+
+
+def download_remote_video_to_temp(media_url: str) -> Optional[str]:
+    """
+    Safely downloads a bounded remote video stream to a temporary file for OpenCV inspection.
+    Returns the temp file path on success, or None if unavailable/offline/non-video.
+    Follows redirects and validates the final resolved URL against SSRF.
+    """
+    tmp_path, _, _ = download_remote_video_with_diagnostics(media_url)
+    return tmp_path
+
+
+def extract_audio_with_ffmpeg(video_path: str, output_dir: str) -> Optional[str]:
+    """
+    Extracts audio from a video file using ffmpeg as mono 16kHz PCM WAV.
+    Returns the .wav path on success, None on failure.
+    Cleans up partial output on failure.
+    """
+    ffmpeg_path = shutil.which("ffmpeg")
+    if not ffmpeg_path:
+        logger.info("audio_extraction: ffmpeg not found on PATH, skipping audio extraction")
         return None
+
+    os.makedirs(output_dir, exist_ok=True)
+    output_filename = f"audio_{uuid.uuid4().hex[:12]}.wav"
+    output_path = os.path.join(output_dir, output_filename)
+
+    cmd = [
+        ffmpeg_path, "-i", video_path,
+        "-vn",                      # no video
+        "-acodec", "pcm_s16le",     # 16-bit PCM
+        "-ar", "16000",             # 16kHz sample rate
+        "-ac", "1",                 # mono
+        "-y",                       # overwrite output
+        output_path,
+    ]
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            stderr_snippet = result.stderr[:500].decode("utf-8", errors="replace") if result.stderr else ""
+            logger.warning(
+                "audio_extraction: ffmpeg exited with code %d (stderr=%s)",
+                result.returncode, stderr_snippet,
+            )
+            # Clean up partial output
+            if os.path.exists(output_path):
+                try:
+                    os.remove(output_path)
+                except OSError:
+                    pass
+            return None
+
+        if not os.path.exists(output_path) or os.path.getsize(output_path) < 44:
+            logger.info("audio_extraction: output file missing or too small, skipping")
+            if os.path.exists(output_path):
+                try:
+                    os.remove(output_path)
+                except OSError:
+                    pass
+            return None
+
+        logger.info(
+            "audio_extraction: successfully extracted audio (size=%d bytes)",
+            os.path.getsize(output_path),
+        )
+        return output_path
+
+    except subprocess.TimeoutExpired:
+        logger.warning("audio_extraction: ffmpeg timed out after 30 seconds")
+        if os.path.exists(output_path):
+            try:
+                os.remove(output_path)
+            except OSError:
+                pass
+        return None
+    except Exception as exc:
+        logger.warning("audio_extraction: unexpected error (%s)", type(exc).__name__)
+        if os.path.exists(output_path):
+            try:
+                os.remove(output_path)
+            except OSError:
+                pass
+        return None
+
+
+def detect_audio_pauses_with_ffmpeg(
+    audio_path: str,
+    silence_threshold_db: float = -30.0,
+    min_duration_sec: float = 1.2,
+) -> List[Dict[str, float]]:
+    """
+    Detects silent pauses in an audio file using FFmpeg's silencedetect filter.
+    Returns a list of dicts with start, end, and duration.
+    """
+    ffmpeg_path = shutil.which("ffmpeg")
+    if not ffmpeg_path or not os.path.exists(audio_path):
+        return []
+
+    cmd = [
+        ffmpeg_path, "-i", audio_path,
+        "-af", f"silencedetect=noise={silence_threshold_db}dB:d={min_duration_sec}",
+        "-f", "null", "-",
+    ]
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=30)
+        stderr_text = result.stderr.decode("utf-8", errors="replace") if result.stderr else ""
+
+        starts = re.findall(r"silence_start:\s*([0-9.]+)", stderr_text)
+        ends = re.findall(r"silence_end:\s*([0-9.]+)\s*\|\s*silence_duration:\s*([0-9.]+)", stderr_text)
+
+        pauses = []
+        for i, start_str in enumerate(starts):
+            start = float(start_str)
+            if i < len(ends):
+                end = float(ends[i][0])
+                duration = float(ends[i][1])
+            else:
+                end = start + min_duration_sec
+                duration = min_duration_sec
+            pauses.append({
+                "start": round(start, 2),
+                "end": round(end, 2),
+                "duration": round(duration, 2),
+            })
+        logger.info("silence_detection: detected %d pause(s) >= %.1fs in audio", len(pauses), min_duration_sec)
+        return pauses
+    except Exception as exc:
+        logger.warning("silence_detection: error detecting pauses (%s)", type(exc).__name__)
+        return []
 
 
 def _classify_aspect_ratio(width: int, height: int) -> str:
@@ -146,6 +492,8 @@ def unavailable_video_metrics(reason: str, video_source: str = "UNAVAILABLE") ->
         "is_simulated": False,
         "video_source": video_source,
         "limitation": reason,
+        "audio_extracted": False,
+        "detected_pauses": None,
     }
 
 
@@ -171,19 +519,38 @@ def extract_video_metadata_and_frames(
     try:
         if not active_path or not os.path.exists(active_path):
             if media_url:
-                downloaded_temp = download_remote_video_to_temp(media_url)
+                url_type = classify_video_url_type(media_url)
+                if url_type == "INSTAGRAM_PAGE":
+                    if allow_simulation:
+                        return generate_simulated_video_metrics(source_identifier or media_url or "sandbox_reel", output_thumbnail_dir)
+                    return unavailable_video_metrics(
+                        "Instagram Reel page URLs do not provide direct video stream access without authentication. "
+                        "To analyze frame-level visual cuts, pacing, and safe zones, please upload the video file directly (Mode B) "
+                        "or connect your Instagram account (Mode C).",
+                        video_source="INSTAGRAM_PAGE_UNSUPPORTED",
+                    )
+                downloaded_temp, stream_source, stream_limitation = download_remote_video_with_diagnostics(media_url)
                 if downloaded_temp and os.path.exists(downloaded_temp):
                     active_path = downloaded_temp
-                    video_source = "OPENCV_REMOTE_STREAM"
+                    video_source = stream_source or "OPENCV_REMOTE_STREAM"
+                elif stream_limitation:
+                    if allow_simulation:
+                        return generate_simulated_video_metrics(source_identifier or media_url or "sandbox_reel", output_thumbnail_dir)
+                    return unavailable_video_metrics(
+                        stream_limitation,
+                        video_source=stream_source or "DOWNLOAD_FAILED",
+                    )
 
         if not active_path or not os.path.exists(active_path):
             if allow_simulation:
                 return generate_simulated_video_metrics(source_identifier or media_url or "sandbox_reel", output_thumbnail_dir)
             return unavailable_video_metrics(
-                "No local video file or accessible video stream could be downloaded; duration, FPS, resolution, and frame-level visual findings are unavailable."
+                "No local video file or accessible video stream could be downloaded; duration, FPS, resolution, and frame-level visual findings are unavailable.",
+                video_source="VIDEO_UNAVAILABLE",
             )
 
         if not HAS_OPENCV:
+            logger.warning("video_extraction: OpenCV (cv2) is not available in this runtime")
             if allow_simulation:
                 return generate_simulated_video_metrics(source_identifier or active_path, output_thumbnail_dir)
             return unavailable_video_metrics(
@@ -191,8 +558,10 @@ def extract_video_metadata_and_frames(
                 video_source="DECODER_UNAVAILABLE",
             )
 
+        logger.info("video_extraction: opening video with OpenCV (source=%s)", video_source)
         cap = cv2.VideoCapture(active_path)
         if not cap.isOpened():
+            logger.warning("video_extraction: VideoCapture.isOpened() returned False")
             if allow_simulation:
                 return generate_simulated_video_metrics(source_identifier or active_path, output_thumbnail_dir)
             return unavailable_video_metrics(
@@ -361,6 +730,10 @@ def extract_video_metadata_and_frames(
             frame_idx += 1
 
         cap.release()
+        logger.info(
+            "video_extraction: decoded %d frames from %d total (source=%s, resolution=%dx%d)",
+            sampled_frame_count, frame_idx, video_source, width, height,
+        )
 
         if current_static_start is not None and (last_sample_sec - current_static_start) >= 2.0:
             static_segments.append({
@@ -401,6 +774,24 @@ def extract_video_metadata_and_frames(
             else 0.0
         )
 
+        # Phase 4: Audio extraction & pause detection via FFmpeg
+        detected_pauses: Optional[List[Dict[str, float]]] = None
+        audio_extracted = False
+        temp_audio_path: Optional[str] = None
+        try:
+            temp_audio_path = extract_audio_with_ffmpeg(active_path, output_thumbnail_dir)
+            if temp_audio_path and os.path.exists(temp_audio_path):
+                audio_extracted = True
+                detected_pauses = detect_audio_pauses_with_ffmpeg(temp_audio_path)
+        except Exception as e:
+            logger.warning("video_extraction: audio processing failed: %s", e)
+        finally:
+            if temp_audio_path and os.path.exists(temp_audio_path):
+                try:
+                    os.remove(temp_audio_path)
+                except OSError:
+                    pass
+
         return {
             "duration_seconds": duration_seconds,
             "duration_measured": duration_measured,
@@ -429,6 +820,8 @@ def extract_video_metadata_and_frames(
             "is_simulated": False,
             "video_source": video_source,
             "limitation": None if duration_measured else "Container did not report FPS; frame timestamps are approximate.",
+            "audio_extracted": audio_extracted,
+            "detected_pauses": detected_pauses,
         }
     finally:
         if downloaded_temp and os.path.exists(downloaded_temp):
@@ -477,4 +870,6 @@ def generate_simulated_video_metrics(source_identifier: str, output_thumbnail_di
         "is_simulated": True,
         "video_source": "SANDBOX_SIMULATED",
         "limitation": "Simulated demo video telemetry generated for sandbox preview (not decoded from live video pixels).",
+        "audio_extracted": False,
+        "detected_pauses": None,
     }

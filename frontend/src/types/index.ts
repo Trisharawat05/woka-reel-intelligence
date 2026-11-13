@@ -238,6 +238,11 @@ export interface ReelAnalysisJob {
   error_message?: string;
   source_url?: string;
   source_media_id?: string;
+  detected_platform?: "instagram" | "youtube" | "tiktok" | "facebook" | "vimeo" | "direct_video" | "other" | string;
+  platform_video_id?: string;
+  retrieval_status?: "DETECTING_PLATFORM" | "AUTH_REQUIRED" | "CONNECT_ACCOUNT" | "EXTRACTING_METADATA" | "DOWNLOADING_VIDEO" | "VIDEO_RETRIEVED" | "PROCESSING" | "COMPLETED" | "UNSUPPORTED" | "EXTRACTION_FAILED" | string;
+  next_action?: string;
+  next_action_url?: string;
   report_id?: string;
   created_at: string;
   updated_at: string;
@@ -257,6 +262,7 @@ export interface MetricItem {
   benchmark?: string;
   benchmark_status: "ABOVE_AVERAGE" | "AVERAGE" | "BELOW_AVERAGE" | "N/A";
   limitations: string;
+  unavailable_reason?: string;
 }
 
 export interface ScoreComponent {

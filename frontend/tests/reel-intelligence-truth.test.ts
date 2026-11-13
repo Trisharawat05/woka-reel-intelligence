@@ -52,3 +52,75 @@ test("formatReportDurationLabel reports Unavailable when stream duration is unme
     "18.4s"
   );
 });
+
+test("universal video URL report badge displays Universal Video URL Analysis", () => {
+  const publicVideoReport = {
+    analysis_mode: "PUBLIC_URL" as const,
+    provenance: { is_simulated: false },
+  };
+  const badge = getReportSourceBadge(publicVideoReport);
+  assert.equal(badge.label, "Universal Video URL Analysis");
+  assert.equal(badge.variant, "sandbox");
+});
+
+test("Mode A metric items distinguish measured values from unavailable explanations", () => {
+  const measuredMetric = {
+    name: "Likes",
+    value: 1840,
+    formatted: "1,840",
+    numerator: "Total like reactions",
+    denominator: "None",
+    time_window: "Lifetime",
+    source: "Public Video Metadata (Likes)",
+    category: "MEASURED",
+    benchmark_status: "N/A" as const,
+    limitations: "Reported from public video page metadata.",
+  };
+  assert.equal(getMetricCategoryBadge(measuredMetric).label, "Measured");
+
+  const calculatedMetric = {
+    name: "Like Rate (Views)",
+    value: 0.0647,
+    formatted: "6.47%",
+    numerator: "Likes (1,840)",
+    denominator: "Total Views (28,450)",
+    time_window: "Lifetime",
+    source: "Calculated Ratio (Likes / Views)",
+    category: "CALCULATED",
+    benchmark_status: "AVERAGE" as const,
+    limitations: "Does not separate repeat plays from unique viewers.",
+  };
+  assert.equal(getMetricCategoryBadge(calculatedMetric).label, "Calculated");
+
+  const privateMetric = {
+    name: "Unique Reach",
+    value: null,
+    formatted: "N/A",
+    numerator: "Count of unique accounts",
+    denominator: "None",
+    time_window: "Lifetime",
+    source: "Requires connected Instagram account",
+    unavailable_reason: "Requires connected Instagram account",
+    category: "UNAVAILABLE",
+    benchmark_status: "N/A" as const,
+    limitations: "Unique reach requires an authenticated Meta Graph API connection.",
+  };
+  assert.equal(getMetricCategoryBadge(privateMetric).label, "Unavailable");
+  assert.equal(privateMetric.unavailable_reason, "Requires connected Instagram account");
+
+  const insufficientDataMetric = {
+    name: "Like Rate (Views)",
+    value: null,
+    formatted: "N/A",
+    numerator: "Likes",
+    denominator: "Total Views",
+    time_window: "Lifetime",
+    source: "Insufficient data to calculate",
+    unavailable_reason: "Insufficient data to calculate",
+    category: "UNAVAILABLE",
+    benchmark_status: "N/A" as const,
+    limitations: "Requires both Likes and Views counts.",
+  };
+  assert.equal(getMetricCategoryBadge(insufficientDataMetric).label, "Unavailable");
+  assert.equal(insufficientDataMetric.unavailable_reason, "Insufficient data to calculate");
+});

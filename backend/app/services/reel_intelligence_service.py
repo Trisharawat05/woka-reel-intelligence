@@ -251,6 +251,8 @@ def upsert_reel_report_for_job(
     job_row.stage_message = "Analysis finalized and ready for review"
     job_row.error_message = None
     job_row.completed_at = datetime.now(timezone.utc)
+    if job_row.retrieval_status in ("VIDEO_RETRIEVED", "PROCESSING", "DOWNLOADING_VIDEO", None):
+        job_row.retrieval_status = "COMPLETED"
     db.commit()
     db.refresh(report)
     db.refresh(job_row)
@@ -343,90 +345,12 @@ def validate_video_file_magic_bytes(header_bytes: bytes) -> bool:
 
 
 def validate_instagram_reel_url(url: str) -> Dict[str, Any]:
-    """Validates Instagram Reel / Post URLs and extracts media shortcode with SSRF protection."""
-    if not url or not isinstance(url, str):
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="A valid video URL must be provided."
-        )
-    
-    clean_url = url.strip()
-    
-    try:
-        parsed = urlparse(clean_url)
-    except Exception:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Malformed URL provided."
-        )
-
-    if parsed.scheme not in ["http", "https"]:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Invalid URL scheme. Only HTTP/HTTPS URLs are supported."
-        )
-
-    hostname = (parsed.hostname or "").lower()
-    if not hostname:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="URL hostname is missing or invalid."
-        )
-
-    # SSRF Protection: verify host is not private/loopback/link-local/metadata
-    restricted_hostnames = {
-        "localhost", "127.0.0.1", "0.0.0.0", "::1",
-        "metadata.google.internal", "instance-data", "metadata"
-    }
-    if (
-        hostname in restricted_hostnames
-        or hostname.endswith(".localhost")
-        or hostname.endswith(".local")
-        or hostname.endswith(".internal")
-        or (hostname.endswith(".nip.io") and any(is_ip_private_or_restricted(part) for part in hostname.split(".")))
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Access to private or local network addresses is forbidden."
-        )
-
-    # If hostname is an IP address directly, check if private
-    if is_ip_private_or_restricted(hostname):
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Access to private or internal network addresses is forbidden."
-        )
-
-    # DNS Resolution Check: Verify hostname does not resolve to private/loopback/metadata IP
-    try:
-        addr_info = socket.getaddrinfo(hostname, None)
-        for _, _, _, _, sockaddr in addr_info:
-            ip_str = sockaddr[0]
-            if is_ip_private_or_restricted(ip_str):
-                raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    detail="Access to private, link-local, or metadata network addresses is forbidden."
-                )
-    except socket.gaierror:
-        # Hostname cannot be resolved via DNS (offline test environment)
-        pass
-
-    # Matches instagram.com/reel/CODE/, instagram.com/p/CODE/, or direct video files (.mp4/.mov)
-    ig_pattern = r"(?:https?:\/\/)?(?:www\.)?instagram\.com\/(?:reel|p)\/([a-zA-Z0-9_-]+)"
-    match = re.search(ig_pattern, clean_url)
-    
-    if match:
-        shortcode = match.group(1)
-        return {"is_instagram": True, "shortcode": shortcode, "url": clean_url}
-    
-    # Check for direct video links
-    if clean_url.endswith((".mp4", ".mov", ".webm", ".m4v")) or "video" in clean_url.lower():
-        return {"is_instagram": False, "shortcode": None, "url": clean_url}
-        
-    raise HTTPException(
-        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-        detail="Invalid URL format. Please provide an Instagram Reel link (e.g. https://www.instagram.com/reel/...) or video URL."
-    )
+    """
+    Validates any public video URL (Instagram, YouTube, TikTok, Facebook, Vimeo, direct MP4/CDN, other)
+    with SSRF protection, platform detection, and video ID extraction.
+    """
+    from app.services.video_ingestion import validate_video_url_safely
+    return validate_video_url_safely(url)
 
 
 def create_or_get_url_analysis_job(
@@ -435,8 +359,9 @@ def create_or_get_url_analysis_job(
     url: str,
     declared_metrics: Optional[Dict[str, Any]] = None
 ) -> Tuple[ReelAnalysisJob, bool]:
-    """Creates or returns an idempotent active/completed analysis job for a public Reel URL."""
-    validated = validate_instagram_reel_url(url)
+    """Creates or returns an idempotent active/completed analysis job for a video URL."""
+    from app.services.video_ingestion import validate_video_url_safely, RetrievalStatus
+    validated = validate_video_url_safely(url)
 
     # Idempotency check: Return existing active or completed job if identical URL was recently submitted
     existing_job = db.query(ReelAnalysisJob).filter(
@@ -454,15 +379,19 @@ def create_or_get_url_analysis_job(
             detail="Monthly Reel AI analysis quota exceeded for your workspace plan. Please upgrade your subscription."
         )
 
+    platform_name = (validated.get("platform") or "video").replace("_", " ").capitalize()
     job = ReelAnalysisJob(
         workspace_id=workspace_id,
         analysis_mode="PUBLIC_URL",
         input_type="url",
         status="QUEUED",
         progress_percent=5,
-        stage_message="Analysis job queued",
+        stage_message=f"Detected {platform_name} video — queued for ingestion",
         source_url=validated["url"],
-        source_media_id=validated.get("shortcode")
+        source_media_id=validated.get("video_id") or validated.get("shortcode"),
+        detected_platform=validated.get("platform"),
+        platform_video_id=validated.get("video_id"),
+        retrieval_status=RetrievalStatus.DETECTING_PLATFORM.value,
     )
     db.add(job)
     db.commit()
@@ -820,6 +749,9 @@ def execute_reel_analysis(
         real_caption: Optional[str] = None
         real_title: str = f"Reel Analysis — {job.source_media_id or 'Uploaded Video'}"
         authoritative_thumb_url: Optional[str] = None
+        downloaded_temp_video_to_cleanup: Optional[str] = None
+        provider_limitation_reason: Optional[str] = None
+        public_metadata: Optional[Any] = None
 
         if job.analysis_mode == "CONNECTED_ACCOUNT":
             real_caption = (media_meta.get("caption") or "").strip() or None
@@ -831,18 +763,81 @@ def execute_reel_analysis(
         elif job.analysis_mode == "VIDEO_UPLOAD" and original_filename:
             real_title = f"Uploaded Reel — {original_filename[:60]}"
         elif job.analysis_mode == "PUBLIC_URL":
-            real_title = f"Public Reel — {job.source_media_id}" if job.source_media_id else "Public Video Analysis"
+            from app.services.video_ingestion import get_provider_for_url, RetrievalStatus
+            provider = get_provider_for_url(job.source_url)
+            job.detected_platform = provider.platform.value
+            job.platform_video_id = provider.extract_video_id(job.source_url)
+
+            # Metadata extraction
+            job.retrieval_status = RetrievalStatus.EXTRACTING_METADATA.value
+            job.stage_message = f"Extracting metadata from {provider.name.capitalize()}..."
+            db.commit()
+
+            metadata = provider.extract_metadata(job.source_url)
+            public_metadata = metadata
+            if metadata.title:
+                real_title = metadata.title
+            else:
+                real_title = f"{provider.name.capitalize()} Video — {job.platform_video_id or 'Media'}"
+            if metadata.caption:
+                real_caption = metadata.caption
+            if metadata.thumbnail_url:
+                authoritative_thumb_url = metadata.thumbnail_url
+
+            # Access validation & Video Retrieval
+            val = provider.validate_access(job.source_url)
+            if val.allowed:
+                job.retrieval_status = RetrievalStatus.DOWNLOADING_VIDEO.value
+                job.stage_message = f"Downloading video stream from {provider.name.capitalize()}..."
+                job.progress_percent = 25
+                db.commit()
+
+                extraction = provider.retrieve_video(job.source_url)
+                if extraction.video_path:
+                    video_path = extraction.video_path
+                    downloaded_temp_video_to_cleanup = video_path
+                    job.retrieval_status = RetrievalStatus.VIDEO_RETRIEVED.value
+                    job.stage_message = "Video retrieved successfully — starting frame decoding"
+                    job.progress_percent = 35
+                    db.commit()
+                else:
+                    job.retrieval_status = extraction.retrieval_status.value
+                    job.next_action = extraction.next_action
+                    job.next_action_url = extraction.next_action_url
+                    job.stage_message = f"Video retrieval: {extraction.retrieval_status.value}"
+                    provider_limitation_reason = extraction.limitation_reason
+                    db.commit()
+            else:
+                job.retrieval_status = val.status.value
+                job.next_action = val.next_action
+                job.next_action_url = val.next_action_url
+                job.stage_message = f"Access validation: {val.status.value}"
+                provider_limitation_reason = val.reason
+                db.commit()
 
         # Stage 2: Video & Frame Processing (45%)
         job.status = "PROCESSING_VIDEO"
         job.progress_percent = 45
+        if job.analysis_mode == "PUBLIC_URL":
+            if job.retrieval_status == "VIDEO_RETRIEVED":
+                job.retrieval_status = "PROCESSING"
         job.stage_message = "Analyzing video frames, visual pacing, and UI safe zones"
         db.commit()
+
+        target_media_url = media_meta.get("media_url") or (job.source_url if not video_path and not provider_limitation_reason else None)
+        target_domain = urlparse(target_media_url).hostname if target_media_url else None
+        logger.info(
+            "reel_analysis: starting Stage 2 video processing (job_id=%s, mode=%s, has_local_video=%s, media_domain=%s)",
+            job.id,
+            job.analysis_mode,
+            bool(video_path),
+            target_domain,
+        )
 
         output_thumb_dir = os.path.join(STORAGE_BASE_DIR, job.workspace_id, "thumbnails")
         video_intel = run_video_intelligence_pipeline(
             video_path=video_path,
-            media_url=media_meta.get("media_url") or job.source_url,
+            media_url=target_media_url,
             caption=real_caption,
             title=real_title,
             output_thumbnail_dir=output_thumb_dir,
@@ -851,7 +846,28 @@ def execute_reel_analysis(
             original_filename=original_filename,
         )
 
+        if provider_limitation_reason and not video_intel.get("metadata", {}).get("limitation"):
+            video_intel.setdefault("metadata", {})["limitation"] = provider_limitation_reason
+            video_intel["metadata"]["video_stream_analyzed"] = False
+
+        if downloaded_temp_video_to_cleanup and os.path.exists(downloaded_temp_video_to_cleanup):
+            try:
+                os.remove(downloaded_temp_video_to_cleanup)
+            except OSError as err:
+                logger.warning("Failed to clean up downloaded temp video: %s", err)
+
+        stream_analyzed = bool(video_intel.get("metadata", {}).get("video_stream_analyzed"))
+        limitation_reason = video_intel.get("metadata", {}).get("limitation")
+        logger.info(
+            "reel_analysis: Stage 2 complete (job_id=%s, stream_analyzed=%s, limitation=%s)",
+            job.id,
+            stream_analyzed,
+            limitation_reason,
+        )
+
         duration = video_intel.get("metadata", {}).get("duration_seconds")
+        if (duration is None or duration <= 0) and public_metadata and public_metadata.duration_seconds:
+            duration = public_metadata.duration_seconds
 
         # Stage 3: Metric Analysis & Historical Baselines (70%)
         job.status = "ANALYZING_METRICS"
@@ -929,8 +945,38 @@ def execute_reel_analysis(
                 follows = None
                 timestamped_retention_available = False
                 source_type = "SANDBOX_SIMULATION"
+        elif job.analysis_mode == "PUBLIC_URL":
+            # Mode A: Public URL analysis (prioritize explicitly declared creator metrics, else use public metadata)
+            dec = declared_metrics or {}
+            views = dec.get("declared_views")
+            if views is None and public_metadata and public_metadata.views is not None:
+                views = public_metadata.views
+
+            likes = dec.get("declared_likes")
+            if likes is None and public_metadata and public_metadata.likes is not None:
+                likes = public_metadata.likes
+
+            comments = dec.get("declared_comments")
+            if comments is None and public_metadata and public_metadata.comments is not None:
+                comments = public_metadata.comments
+
+            shares = dec.get("declared_shares")
+            if shares is None and public_metadata and public_metadata.shares is not None:
+                shares = public_metadata.shares
+
+            saves = dec.get("declared_saves")
+
+            has_user_declared = any(dec.get(k) is not None for k in ("declared_views", "declared_likes", "declared_comments", "declared_shares", "declared_saves"))
+            has_public_meta = public_metadata and any(v is not None for v in (public_metadata.views, public_metadata.likes, public_metadata.comments))
+
+            if has_user_declared:
+                source_type = "USER_DECLARED"
+            elif has_public_meta:
+                source_type = "PUBLIC_METADATA"
+            else:
+                source_type = "UNAVAILABLE"
         else:
-            # Public URL / Pre-publish Upload: use ONLY explicitly user-supplied inputs; never invent defaults
+            # Mode B: Pre-publish Video Upload (use ONLY explicitly user-supplied inputs; never invent defaults)
             dec = declared_metrics or {}
             views = dec.get("declared_views")
             likes = dec.get("declared_likes")
@@ -1012,6 +1058,17 @@ def execute_reel_analysis(
 
         # Stage 5: Finalize & Persist Report Atomically (100%)
         scores = ai_report_data["scores"]
+        ai_report_data["provenance"]["detected_platform"] = job.detected_platform
+        ai_report_data["provenance"]["platform_video_id"] = job.platform_video_id
+        ai_report_data["provenance"]["retrieval_status"] = job.retrieval_status
+        ai_report_data["provenance"]["next_action"] = job.next_action
+        ai_report_data["provenance"]["next_action_url"] = job.next_action_url
+        ai_report_data["provenance"]["metric_source_mode"] = source_type
+        if public_metadata:
+            ai_report_data["provenance"]["public_metadata_extracted"] = True
+            if public_metadata.author:
+                ai_report_data["provenance"]["public_creator_handle"] = public_metadata.author
+
         saved_thumb = video_intel.get("hook_analysis", {}).get("first_frame_thumbnail_saved")
         if saved_thumb:
             thumbnail_url: Optional[str] = f"/api/v1/reel-intelligence/thumbnails/{saved_thumb}"
@@ -1067,6 +1124,7 @@ def execute_reel_analysis(
                     )
                 else:
                     failed_job.status = "FAILED"
+                    failed_job.retrieval_status = "EXTRACTION_FAILED"
                     failed_job.stage_message = "Analysis failed"
                     failed_job.error_message = sanitize_job_error_message(e)
                     db.commit()

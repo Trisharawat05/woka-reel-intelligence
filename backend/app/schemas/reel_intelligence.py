@@ -30,6 +30,11 @@ class ReelAnalysisJobResponse(BaseModel):
     error_message: Optional[str] = None
     source_url: Optional[str] = None
     source_media_id: Optional[str] = None
+    detected_platform: Optional[str] = None
+    platform_video_id: Optional[str] = None
+    retrieval_status: Optional[str] = None
+    next_action: Optional[str] = None
+    next_action_url: Optional[str] = None
     report_id: Optional[str] = None
     created_at: datetime
     updated_at: datetime
@@ -51,6 +56,7 @@ class MetricItem(BaseModel):
     benchmark: Optional[str] = None
     benchmark_status: Optional[str] = "N/A"  # ABOVE_AVERAGE, AVERAGE, BELOW_AVERAGE, N/A
     limitations: str
+    unavailable_reason: Optional[str] = None
 
 
 class ScoreComponent(BaseModel):

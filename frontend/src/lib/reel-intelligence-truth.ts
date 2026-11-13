@@ -17,7 +17,7 @@ export function getReportSourceBadge(report: Pick<ReelReport, "analysis_mode" | 
   if (report.analysis_mode === "VIDEO_UPLOAD") {
     return { label: "Local Video Draft", variant: "secondary" };
   }
-  return { label: "Public URL Mode", variant: "sandbox" };
+  return { label: "Universal Video URL Analysis", variant: "sandbox" };
 }
 
 export function getMetricCategoryBadge(item: Pick<MetricItem, "category" | "value" | "is_simulated">): {
@@ -49,3 +49,66 @@ export function formatReportDurationLabel(report: Pick<ReelReport, "duration_sec
   }
   return "Unavailable";
 }
+
+export interface VideoExtractionStatusResult {
+  status: "DECODED" | "FAILED" | "SIMULATED" | "UNAVAILABLE";
+  message: string;
+  canRetry: boolean;
+}
+
+export function getVideoExtractionStatus(
+  report: Pick<ReelReport, "video_intelligence" | "provenance" | "analysis_mode">
+): VideoExtractionStatusResult {
+  if (isReportSimulated(report)) {
+    return {
+      status: "SIMULATED",
+      message: "Synthetic sandbox metrics rendered for demonstration. Pixel-level decoding was not performed on a real video stream.",
+      canRetry: false,
+    };
+  }
+
+  const vi = report.video_intelligence;
+  if (!vi) {
+    return {
+      status: "UNAVAILABLE",
+      message: "No video stream data available for this report.",
+      canRetry: true,
+    };
+  }
+
+  const isStreamAnalyzed = Boolean(
+    vi.video_stream_analyzed ??
+    vi.metadata?.video_stream_analyzed ??
+    report.provenance?.video_stream_analyzed
+  );
+
+  if (isStreamAnalyzed) {
+    const meta = vi.metadata || {};
+    const width = meta.width ?? meta.resolution_width ?? 0;
+    const height = meta.height ?? meta.resolution_height ?? 0;
+    const fps = meta.fps ? Number(meta.fps).toFixed(1) : "0.0";
+    const dur = meta.duration_seconds ? Number(meta.duration_seconds).toFixed(1) : "0.0";
+    const cuts = vi.visual_metrics?.scene_cuts_count ?? vi.visual_pacing?.cuts_detected ?? 0;
+    return {
+      status: "DECODED",
+      message: `Video stream successfully decoded locally (${width}x${height} @ ${fps} fps, ${dur}s, ${cuts} scene cuts detected).`,
+      canRetry: false,
+    };
+  }
+
+  // If stream was not analyzed
+  const reason =
+    vi.limitation_reason ||
+    vi.metadata?.limitation ||
+    report.provenance?.video_limitation ||
+    (report.analysis_mode === "PUBLIC_URL"
+      ? "Public Instagram Reel page URLs require authentication to access the underlying video stream. Raw video pixels could not be retrieved directly."
+      : "Video stream could not be decoded.");
+
+  return {
+    status: "FAILED",
+    message: reason,
+    canRetry: true,
+  };
+}
+
